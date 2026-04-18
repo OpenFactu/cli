@@ -9,9 +9,9 @@ import fs from 'fs';
 import path from 'path';
 import { log } from '../utils/logger';
 
-const REPO_URL = 'https://github.com/AngelAcedo12/OpenFactu.git';
-const GITHUB_OWNER = 'AngelAcedo12';
-const GITHUB_REPO = 'OpenFactu';
+const REPO_URL = 'https://github.com/OpenFactu/platform.git';
+const GITHUB_OWNER = 'OpenFactu';
+const GITHUB_REPO = 'platform';
 
 interface GithubRelease {
   tag_name: string;

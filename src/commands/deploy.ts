@@ -82,6 +82,7 @@ export function registerDeployCommand(program: Command) {
         let host = 'localhost';
         let serverPort = '3000';
         let webPort = '8080';
+        let dbPort = '5432';
         let useSSL = false;
 
         if (mode === 'lan') {
@@ -131,7 +132,7 @@ export function registerDeployCommand(program: Command) {
           {
             type: 'confirm',
             name: 'ports',
-            message: `¿Usar puertos por defecto? (web: 8080, api: 3000)`,
+            message: `¿Usar puertos por defecto? (web: 8080, api: 3000, db: 5432)`,
             default: true,
           },
         ]);
@@ -140,9 +141,11 @@ export function registerDeployCommand(program: Command) {
           const answers = await inquirer.prompt([
             { type: 'input', name: 'webPort', message: 'Puerto web:', default: '8080' },
             { type: 'input', name: 'serverPort', message: 'Puerto API:', default: '3000' },
+            { type: 'input', name: 'dbPort', message: 'Puerto BD (host):', default: '5432' },
           ]);
           webPort = answers.webPort;
           serverPort = answers.serverPort;
+          dbPort = answers.dbPort;
         }
 
         // Password de BD
@@ -168,6 +171,7 @@ export function registerDeployCommand(program: Command) {
         log.title('  Resumen de configuración');
         log.info(`Web:         ${chalk.cyan(webUrl)}`);
         log.info(`API:         ${chalk.cyan(apiUrl)}`);
+        log.info(`BD Puerto:   ${chalk.cyan(dbPort)} ${chalk.dim('(host)')}`);
         log.info(`BD Password: ${chalk.dim(dbPassword === 'openfactu_pass' ? '(default)' : '****')}`);
         log.info(`SSL:         ${useSSL ? chalk.green('Si') : chalk.dim('No')}`);
         log.blank();
@@ -186,7 +190,7 @@ export function registerDeployCommand(program: Command) {
         const env = readEnv(envPath);
         env.SERVER_PORT = serverPort;
         env.WEB_PORT = webPort;
-        env.DB_PORT = env.DB_PORT || '5432';
+        env.DB_PORT = dbPort;
         env.POSTGRES_USER = env.POSTGRES_USER || 'openfactu';
         env.POSTGRES_PASSWORD = dbPassword;
         env.POSTGRES_DB = env.POSTGRES_DB || 'openfactudb';

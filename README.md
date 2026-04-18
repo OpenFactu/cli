@@ -1,6 +1,6 @@
 # @openfactu/cli
 
-CLI oficial para instalar, gestionar y desplegar [OpenFactu](https://github.com/AngelAcedo12/OpenFactu) — ERP de facturacion open source.
+CLI oficial para instalar, gestionar y desplegar [OpenFactu](https://github.com/OpenFactu/platform) — ERP de facturacion open source.
 
 ## Instalacion
 
@@ -104,7 +104,7 @@ openfactu migrate
 
 ## Links
 
-- [GitHub](https://github.com/AngelAcedo12/OpenFactu)
+- [GitHub](https://github.com/OpenFactu/platform)
 - [Documentacion](https://openfactuerp.org)
 - [Marketplace](https://openfactuerp.org/marketplace/)
-- [Reportar problema](https://github.com/AngelAcedo12/OpenFactu/issues)
+- [Reportar problema](https://github.com/OpenFactu/platform/issues)

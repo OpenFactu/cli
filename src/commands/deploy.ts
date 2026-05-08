@@ -7,7 +7,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { log } from '../utils/logger';
-import { getProjectRoot } from '../utils/paths';
+import { getProjectRoot, getMonitoringComposePath } from '../utils/paths';
 
 function getLocalIPs(): string[] {
   const interfaces = os.networkInterfaces();
@@ -50,7 +50,8 @@ export function registerDeployCommand(program: Command) {
   program
     .command('deploy')
     .description('Configura OpenFactu para producción (acceso externo)')
-    .action(async () => {
+    .option('--with-monitoring', 'Incluir stack de monitoreo (Grafana, Prometheus, etc.)')
+    .action(async (opts) => {
       console.log();
       console.log(chalk.bold.white('  OpenFactu — Configurar Despliegue'));
       console.log(chalk.dim('  ────────────────────────────────────'));
@@ -300,6 +301,80 @@ networks:
         fs.writeFileSync(prodComposePath, composeContent);
         prodSpinner.succeed('docker-compose.prod.yml generado');
 
+        // Generar docker-compose.prod.monitoring.yml si se pidió monitoreo
+        if (opts.withMonitoring) {
+          const monSpinner = ora('Generando docker-compose.prod.monitoring.yml...').start();
+          const monitoringComposePath = path.join(root, 'docker-compose.prod.monitoring.yml');
+          const monitoringCompose = `services:
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    environment:
+      PGADMIN_DEFAULT_EMAIL: \${PGADMIN_EMAIL:-admin@openfactu.local}
+      PGADMIN_DEFAULT_PASSWORD: \${PGADMIN_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "0.0.0.0:\${PGADMIN_PORT:-5050}:80"
+    volumes:
+      - ./storage/pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      - db
+    restart: unless-stopped
+    networks:
+      - openfactu_net
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      - GF_SECURITY_ADMIN_USER=\${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=\${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "0.0.0.0:\${GRAFANA_PORT:-3001}:3000"
+    volumes:
+      - ./storage/grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - openfactu_net
+
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.enable-lifecycle'
+    ports:
+      - "0.0.0.0:\${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./storage/prometheus_data:/prometheus
+    restart: unless-stopped
+    networks:
+      - openfactu_net
+
+  portainer:
+    image: portainer/portainer-ce:latest
+    command: -H unix:///var/run/docker.sock
+    ports:
+      - "0.0.0.0:\${PORTAINER_PORT:-9000}:9000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./storage/portainer_data:/data
+    restart: unless-stopped
+    networks:
+      - openfactu_net
+
+networks:
+  openfactu_net:
+    name: openfactu_net
+    driver: bridge
+`;
+          fs.writeFileSync(monitoringComposePath, monitoringCompose);
+          monSpinner.succeed('docker-compose.prod.monitoring.yml generado');
+        }
+
         // 6. Preguntar si levantar
         log.blank();
         const { start } = await inquirer.prompt([
@@ -359,16 +434,23 @@ networks:
   program
     .command('deploy:status')
     .description('Muestra el estado de los servicios Docker')
-    .action(async () => {
+    .option('--with-monitoring', 'Incluir servicios de monitoreo')
+    .action(async (opts) => {
       try {
         const root = getProjectRoot();
         const prodCompose = path.join(root, 'docker-compose.prod.yml');
         const composeFile = fs.existsSync(prodCompose) ? 'docker-compose.prod.yml' : 'docker-compose.yml';
+        const monitoringCompose = path.join(root, 'docker-compose.prod.monitoring.yml');
+        const useMonitoring = opts.withMonitoring && fs.existsSync(monitoringCompose);
 
         log.info(`Usando: ${chalk.dim(composeFile)}`);
+        if (useMonitoring) log.info(`Monitoreo: ${chalk.dim('docker-compose.prod.monitoring.yml')}`);
         log.blank();
 
-        const output = execSync(`docker compose -f ${composeFile} ps`, {
+        const files = useMonitoring
+          ? `-f ${composeFile} -f docker-compose.prod.monitoring.yml`
+          : `-f ${composeFile}`;
+        const output = execSync(`docker compose ${files} ps`, {
           cwd: root,
         }).toString();
 
@@ -397,21 +479,29 @@ networks:
     .description('Reconstruye y reinicia los contenedores Docker')
     .option('--service <name>', 'Reconstruir solo un servicio (web, server, db)')
     .option('--no-cache', 'Construir sin cache de Docker')
+    .option('--with-monitoring', 'Incluir servicios de monitoreo')
     .action(async (opts) => {
       try {
         const root = getProjectRoot();
         const prodCompose = path.join(root, 'docker-compose.prod.yml');
         const composeFile = fs.existsSync(prodCompose) ? 'docker-compose.prod.yml' : 'docker-compose.yml';
+        const monitoringCompose = path.join(root, 'docker-compose.prod.monitoring.yml');
+        const useMonitoring = opts.withMonitoring && fs.existsSync(monitoringCompose);
 
         const service = opts.service || '';
         const noCache = opts.cache === false ? ' --no-cache' : '';
 
         log.info(`Usando: ${chalk.dim(composeFile)}`);
+        if (useMonitoring) log.info(`Monitoreo: ${chalk.dim('docker-compose.prod.monitoring.yml')}`);
         log.blank();
+
+        const files = useMonitoring
+          ? `-f ${composeFile} -f docker-compose.prod.monitoring.yml`
+          : `-f ${composeFile}`;
 
         const buildSpinner = ora(`Construyendo${service ? ' ' + service : ' todos los servicios'}...`).start();
         try {
-          execSync(`docker compose -f ${composeFile} build${noCache} ${service}`, {
+          execSync(`docker compose ${files} build${noCache} ${service}`, {
             cwd: root,
             stdio: 'pipe',
             timeout: 600000,
@@ -433,7 +523,7 @@ networks:
 
         const upSpinner = ora('Reiniciando servicios...').start();
         try {
-          execSync(`docker compose -f ${composeFile} up -d ${service}`, {
+          execSync(`docker compose ${files} up -d ${service}`, {
             cwd: root,
             stdio: 'pipe',
             timeout: 60000,
@@ -467,16 +557,23 @@ networks:
     .description('Muestra los logs de los servicios Docker')
     .option('--service <name>', 'Logs de un servicio especifico (web, server, db)')
     .option('-n, --lines <number>', 'Numero de lineas', '50')
+    .option('--with-monitoring', 'Incluir servicios de monitoreo')
     .action(async (opts) => {
       try {
         const root = getProjectRoot();
         const prodCompose = path.join(root, 'docker-compose.prod.yml');
         const composeFile = fs.existsSync(prodCompose) ? 'docker-compose.prod.yml' : 'docker-compose.yml';
+        const monitoringCompose = path.join(root, 'docker-compose.prod.monitoring.yml');
+        const useMonitoring = opts.withMonitoring && fs.existsSync(monitoringCompose);
 
         const service = opts.service || '';
         const lines = opts.lines || '50';
 
-        execSync(`docker compose -f ${composeFile} logs --tail ${lines} ${service}`, {
+        const files = useMonitoring
+          ? `-f ${composeFile} -f docker-compose.prod.monitoring.yml`
+          : `-f ${composeFile}`;
+
+        execSync(`docker compose ${files} logs --tail ${lines} ${service}`, {
           cwd: root,
           stdio: 'inherit',
         });
@@ -489,14 +586,21 @@ networks:
   program
     .command('stop')
     .description('Para todos los servicios Docker')
-    .action(async () => {
+    .option('--with-monitoring', 'Incluir servicios de monitoreo')
+    .action(async (opts) => {
       try {
         const root = getProjectRoot();
         const prodCompose = path.join(root, 'docker-compose.prod.yml');
         const composeFile = fs.existsSync(prodCompose) ? 'docker-compose.prod.yml' : 'docker-compose.yml';
+        const monitoringCompose = path.join(root, 'docker-compose.prod.monitoring.yml');
+        const useMonitoring = opts.withMonitoring && fs.existsSync(monitoringCompose);
+
+        const files = useMonitoring
+          ? `-f ${composeFile} -f docker-compose.prod.monitoring.yml`
+          : `-f ${composeFile}`;
 
         const spinner = ora('Parando servicios...').start();
-        execSync(`docker compose -f ${composeFile} down`, { cwd: root, stdio: 'pipe' });
+        execSync(`docker compose ${files} down`, { cwd: root, stdio: 'pipe' });
         spinner.succeed('Servicios parados');
       } catch (err: any) {
         log.error(err.message);
@@ -508,15 +612,22 @@ networks:
     .command('restart')
     .description('Reinicia los servicios Docker (sin rebuild)')
     .option('--service <name>', 'Reiniciar solo un servicio')
+    .option('--with-monitoring', 'Incluir servicios de monitoreo')
     .action(async (opts) => {
       try {
         const root = getProjectRoot();
         const prodCompose = path.join(root, 'docker-compose.prod.yml');
         const composeFile = fs.existsSync(prodCompose) ? 'docker-compose.prod.yml' : 'docker-compose.yml';
+        const monitoringCompose = path.join(root, 'docker-compose.prod.monitoring.yml');
+        const useMonitoring = opts.withMonitoring && fs.existsSync(monitoringCompose);
+
+        const files = useMonitoring
+          ? `-f ${composeFile} -f docker-compose.prod.monitoring.yml`
+          : `-f ${composeFile}`;
 
         const service = opts.service || '';
         const spinner = ora('Reiniciando...').start();
-        execSync(`docker compose -f ${composeFile} restart ${service}`, { cwd: root, stdio: 'pipe' });
+        execSync(`docker compose ${files} restart ${service}`, { cwd: root, stdio: 'pipe' });
         spinner.succeed('Servicios reiniciados');
       } catch (err: any) {
         log.error(err.message);

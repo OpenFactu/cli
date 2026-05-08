@@ -7,6 +7,7 @@ import { registerSetupCommand } from './commands/setup';
 import { registerUpdateCommand } from './commands/update';
 import { registerInstallCommand } from './commands/install';
 import { registerDeployCommand } from './commands/deploy';
+import { registerMonitoringCommand } from './commands/monitoring';
 
 export function createCLI() {
   const program = new Command();
@@ -24,6 +25,7 @@ export function createCLI() {
   registerUpdateCommand(program);
   registerInstallCommand(program);
   registerDeployCommand(program);
+  registerMonitoringCommand(program);
 
   return program;
 }

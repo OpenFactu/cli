@@ -79,3 +79,5 @@ export function getServerSrcDir() { return path.join(getServerDir(), 'src'); }
 export function getMigrationsDir() { return path.join(getServerSrcDir(), 'core/tenant/migrations'); }
 export function getPluginsDir() { return path.join(getProjectRoot(), 'plugins'); }
 export function getEnvPath() { return path.join(getProjectRoot(), '.env'); }
+
+export function getMonitoringComposePath() { return path.join(getProjectRoot(), 'docker-compose.monitoring.yml'); }

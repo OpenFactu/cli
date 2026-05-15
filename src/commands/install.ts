@@ -15,6 +15,7 @@ import {
   waitForService,
   getDockerComposeCommand,
   checkDiskSpace,
+  isLinux,
 } from '../utils/helpers';
 
 const REPO_URL = 'https://github.com/OpenFactu/platform.git';
@@ -102,6 +103,26 @@ function validateRepoStructure(targetDir: string): { valid: boolean; missing: st
   return { valid: missing.length === 0, missing };
 }
 
+const installLog: string[] = [];
+
+function logStep(message: string, status: 'info' | 'success' | 'warn' | 'error' = 'info') {
+  const timestamp = new Date().toISOString();
+  const prefix = status === 'success' ? '✓' : status === 'error' ? '✗' : status === 'warn' ? '⚠' : '•';
+  const entry = `[${timestamp}] ${prefix} ${message}`;
+  installLog.push(entry);
+}
+
+function writeInstallLog(targetDir: string) {
+  try {
+    const logDir = path.join(targetDir, '.openfactu');
+    if (!fs.existsSync(logDir)) {
+      fs.mkdirSync(logDir, { recursive: true });
+    }
+    const logFile = path.join(logDir, 'install.log');
+    fs.writeFileSync(logFile, installLog.join('\n') + '\n');
+  } catch {}
+}
+
 function generateEnvConfig(targetDir: string): Record<string, string> {
   const dbPassword = generatePassword(24);
   const postgresUser = 'openfactu';
@@ -129,6 +150,34 @@ function generateEnvConfig(targetDir: string): Record<string, string> {
   };
 }
 
+function installService(targetDir: string, dockerCmd: string, serviceName: string, unitPath: string) {
+  const unitContent = `[Unit]
+Description=OpenFactu ERP Platform
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=${targetDir}
+ExecStart=${dockerCmd} -f docker-compose.yml up -d
+ExecStop=${dockerCmd} -f docker-compose.yml down
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+`;
+  fs.writeFileSync(`/tmp/${serviceName}.service`, unitContent);
+  execSync(`sudo mv /tmp/${serviceName}.service ${unitPath}`, { stdio: 'pipe' });
+  execSync('sudo systemctl daemon-reload', { stdio: 'pipe' });
+  execSync(`sudo systemctl enable ${serviceName}`, { stdio: 'pipe' });
+  log.success(`Servicio ${serviceName} instalado y habilitado`);
+  log.dim(`  sudo systemctl start ${serviceName}`);
+  log.dim(`  sudo systemctl status ${serviceName}`);
+}
+
 export function registerInstallCommand(program: Command) {
   program
     .command('install [directory]')
@@ -151,9 +200,13 @@ export function registerInstallCommand(program: Command) {
       console.log(chalk.dim('  ────────────────────────────────────'));
       console.log();
 
+      let targetDir = directory;
+
       try {
         const repoUrl = opts.repo;
         const nonInteractive = opts.yes || false;
+
+        logStep('Inicio de instalación', 'info');
 
         // 0. Preflight checks
         if (opts.preflight !== false) {
@@ -165,6 +218,7 @@ export function registerInstallCommand(program: Command) {
 
           if (fails.length > 0) {
             checkSpinner.fail('Chequeos fallidos');
+            logStep(`Preflight fallido: ${fails.map(f => f.name).join(', ')}`, 'error');
             log.blank();
             log.error('Requisitos no cumplidos:');
             for (const f of fails) {
@@ -179,11 +233,13 @@ export function registerInstallCommand(program: Command) {
             }
           } else if (warns.length > 0) {
             checkSpinner.warn('Chequeos con advertencias');
+            logStep(`Preflight con advertencias: ${warns.map(w => w.name).join(', ')}`, 'warn');
             for (const w of warns) {
               log.warn(`  ⚠ ${w.name}: ${w.message}`);
             }
           } else {
             checkSpinner.succeed(`${checks.length} chequeos pasados`);
+            logStep('Preflight OK', 'success');
           }
           log.blank();
         }
@@ -260,8 +316,6 @@ export function registerInstallCommand(program: Command) {
         log.info(`Versión seleccionada: ${chalk.cyan(ref)}`);
 
         // 3. Directorio destino
-        let targetDir = directory;
-
         if (!targetDir) {
           if (nonInteractive) {
             targetDir = path.join(os.homedir(), 'openfactu');
@@ -303,12 +357,14 @@ export function registerInstallCommand(program: Command) {
         }
 
         log.info(`Directorio: ${chalk.dim(targetDir)}`);
+        logStep(`Directorio: ${targetDir}`, 'info');
         log.blank();
 
         // 4. Crear directorio
         if (!fs.existsSync(targetDir)) {
           try {
             fs.mkdirSync(targetDir, { recursive: true });
+            logStep('Directorio creado', 'success');
           } catch (mkdirErr: any) {
             if (mkdirErr.code === 'EACCES') {
               log.warn('Sin permisos. Creando directorio con sudo...');
@@ -317,8 +373,10 @@ export function registerInstallCommand(program: Command) {
                 execSync(`sudo mkdir -p "${targetDir}" && sudo chown -R ${user}:${user} "${targetDir}"`, {
                   stdio: 'pipe',
                 });
+                logStep('Directorio creado con sudo', 'success');
               } catch {
                 log.error(`No se pudo crear ${targetDir}. Ejecuta con sudo o elige otro directorio.`);
+                logStep(`Error creando directorio: ${targetDir}`, 'error');
                 return;
               }
             } else {
@@ -329,6 +387,7 @@ export function registerInstallCommand(program: Command) {
 
         // 5. Clonar repositorio
         const cloneSpinner = ora('Descargando OpenFactu...').start();
+        logStep('Iniciando clonación del repositorio', 'info');
 
         const isTag = releases.some((r) => r.tag_name === ref);
         const cloneCmd = isTag
@@ -338,14 +397,17 @@ export function registerInstallCommand(program: Command) {
         try {
           execSync(cloneCmd, { stdio: 'pipe', timeout: 120000 });
           cloneSpinner.succeed('Código descargado');
+          logStep(`Repositorio clonado: ${ref}`, 'success');
         } catch (err: any) {
           try {
             cloneSpinner.text = 'Descargando (método alternativo)...';
             execSync(`git clone ${repoUrl} "${targetDir}"`, { stdio: 'pipe', timeout: 180000 });
             execSync(`git checkout ${ref}`, { cwd: targetDir, stdio: 'pipe' });
             cloneSpinner.succeed('Código descargado');
+            logStep(`Repositorio clonado (alternativo): ${ref}`, 'success');
           } catch (err2: any) {
             cloneSpinner.fail('Error al descargar: ' + err2.message);
+            logStep(`Error clonando repositorio: ${err2.message}`, 'error');
             return;
           }
         }
@@ -354,7 +416,10 @@ export function registerInstallCommand(program: Command) {
         const validation = validateRepoStructure(targetDir);
         if (!validation.valid) {
           log.warn(`Estructura incompleta: ${validation.missing.join(', ')}`);
+          logStep(`Estructura incompleta: ${validation.missing.join(', ')}`, 'warn');
           log.dim('  Algunos comandos pueden no funcionar correctamente');
+        } else {
+          logStep('Estructura del repositorio válida', 'success');
         }
 
         // 7. Generar/configurar .env
@@ -469,22 +534,54 @@ export function registerInstallCommand(program: Command) {
           }
         }
 
+        // Preguntar por servicio systemd (siempre, si es Linux)
+        if (!nonInteractive && isLinux() && (installMode === 'full' || installMode === 'docker' || installMode === 'minimal')) {
+          const { installService } = await inquirer.prompt([
+            {
+              type: 'confirm',
+              name: 'installService',
+              message: 'Instalar como servicio systemd (auto-start al iniciar el sistema)?',
+              default: false,
+            },
+          ]);
+          if (installService) opts.service = true;
+        }
+
         // 10. Ejecutar instalación según modo
         const dockerCmd = getDockerComposeCommand();
+        logStep(`Modo de instalación: ${installMode}`, 'info');
 
         if (installMode === 'full' || installMode === 'docker' || installMode === 'minimal') {
           if (installMode === 'full' || installMode === 'docker') {
             const dockerSpinner = ora('Construyendo contenedores Docker...').start();
+            logStep('Iniciando build de Docker', 'info');
             try {
               execSync(`${dockerCmd} build`, { cwd: targetDir, stdio: 'pipe', timeout: 300000 });
               dockerSpinner.succeed('Contenedores construidos');
+              logStep('Build de Docker completado', 'success');
             } catch (err: any) {
               dockerSpinner.fail('Error en build: ' + err.message);
+              logStep(`Error en build de Docker: ${err.message}`, 'error');
               log.dim(`  Ejecuta manualmente: cd ${targetDir} && ${dockerCmd} build`);
+              log.blank();
+              const { continueWithoutBuild } = await inquirer.prompt([
+                {
+                  type: 'confirm',
+                  name: 'continueWithoutBuild',
+                  message: 'El build falló. ¿Continuar sin build y solo levantar contenedores existentes?',
+                  default: false,
+                },
+              ]);
+              if (!continueWithoutBuild) {
+                log.info('Instalación cancelada');
+                writeInstallLog(targetDir);
+                return;
+              }
             }
           }
 
           const upSpinner = ora('Levantando servicios...').start();
+          logStep('Levantando servicios Docker', 'info');
           try {
             let composeFiles = '-f docker-compose.yml';
             if (fs.existsSync(path.join(targetDir, 'docker-compose.prod.yml'))) {
@@ -500,8 +597,10 @@ export function registerInstallCommand(program: Command) {
 
             execSync(`${dockerCmd} ${composeFiles} up -d`, { cwd: targetDir, stdio: 'pipe', timeout: 120000 });
             upSpinner.succeed('Servicios levantados');
+            logStep('Servicios Docker levantados', 'success');
           } catch (err: any) {
             upSpinner.fail('Error: ' + err.message);
+            logStep(`Error levantando servicios: ${err.message}`, 'error');
             log.dim(`  cd ${targetDir} && ${dockerCmd} up -d`);
           }
 
@@ -509,14 +608,17 @@ export function registerInstallCommand(program: Command) {
           if (opts.healthcheck !== false && (installMode === 'full' || installMode === 'docker')) {
             log.blank();
             const healthSpinner = ora('Verificando servicios...').start();
+            logStep('Ejecutando health checks', 'info');
 
             const webHealthy = await waitForService('http://localhost:8080', 20, 3000);
             const apiHealthy = await waitForService('http://localhost:3000/api/health', 15, 3000);
 
             if (webHealthy && apiHealthy) {
               healthSpinner.succeed('Servicios operativos');
+              logStep('Health checks: Web OK, API OK', 'success');
             } else {
               healthSpinner.warn('Algunos servicios tardan en iniciar');
+              logStep(`Health checks: Web=${webHealthy ? 'OK' : 'FAIL'}, API=${apiHealthy ? 'OK' : 'FAIL'}`, 'warn');
               log.dim('  Verifica con: docker compose ps');
             }
           }
@@ -525,6 +627,7 @@ export function registerInstallCommand(program: Command) {
           if (installMode === 'full') {
             log.blank();
             log.info('Ejecutando configuración inicial de base de datos...');
+            logStep('Configurando base de datos', 'info');
             try {
               execSync('docker compose exec -T server sh -c "npm run db:push || true"', {
                 cwd: targetDir,
@@ -532,8 +635,10 @@ export function registerInstallCommand(program: Command) {
                 timeout: 60000,
               });
               log.success('Base de datos configurada');
+              logStep('Base de datos configurada', 'success');
             } catch {
               log.dim('  Ejecuta manualmente: openfactu setup');
+              logStep('Configuración de BD omitida', 'warn');
             }
           }
         }
@@ -544,38 +649,36 @@ export function registerInstallCommand(program: Command) {
           log.info('Instalando servicio systemd...');
           try {
             const serviceName = 'openfactu';
-            const unitContent = `[Unit]
-Description=OpenFactu ERP Platform
-After=docker.service network-online.target
-Requires=docker.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-WorkingDirectory=${targetDir}
-ExecStart=${dockerCmd} -f docker-compose.yml up -d
-ExecStop=${dockerCmd} -f docker-compose.yml down
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-`;
             const unitPath = `/etc/systemd/system/${serviceName}.service`;
-            fs.writeFileSync(`/tmp/${serviceName}.service`, unitContent);
+            const serviceExists = fs.existsSync(unitPath);
 
-            execSync(`sudo mv /tmp/${serviceName}.service ${unitPath}`, { stdio: 'pipe' });
-            execSync('sudo systemctl daemon-reload', { stdio: 'pipe' });
-            execSync(`sudo systemctl enable ${serviceName}`, { stdio: 'pipe' });
-
-            log.success(`Servicio ${serviceName} instalado y habilitado`);
-            log.dim(`  sudo systemctl start ${serviceName}`);
-            log.dim(`  sudo systemctl status ${serviceName}`);
+            if (serviceExists && !nonInteractive) {
+              const { overwriteService } = await inquirer.prompt([
+                {
+                  type: 'confirm',
+                  name: 'overwriteService',
+                  message: `El servicio ${serviceName} ya existe. ¿Sobrescribir?`,
+                  default: false,
+                },
+              ]);
+              if (!overwriteService) {
+                log.info('Servicio no modificado');
+              } else {
+                installService(targetDir, dockerCmd, serviceName, unitPath);
+              }
+            } else if (serviceExists && nonInteractive) {
+              log.warn(`El servicio ${serviceName} ya existe, sobrescribiendo`);
+              installService(targetDir, dockerCmd, serviceName, unitPath);
+            } else {
+              installService(targetDir, dockerCmd, serviceName, unitPath);
+            }
           } catch (err: any) {
             log.warn('No se pudo instalar el servicio: ' + err.message);
           }
         }
+
+        // 12. Escribir log de instalacion
+        writeInstallLog(targetDir);
 
         // 12. Resumen
         const installedPkg = path.join(targetDir, 'package.json');
@@ -604,6 +707,9 @@ WantedBy=multi-user.target
         if (includeAnalytics) console.log(`  ${chalk.dim('Analítica:')}  ${chalk.green('Incluida')}`);
         log.blank();
 
+        logStep('Instalación completada exitosamente', 'success');
+        logStep(`Versión: ${installedVersion}, Ref: ${ref}, Commit: ${installedCommit}`, 'info');
+
         log.dim('  Próximos pasos:');
         log.dim(`    cd ${targetDir}`);
         if (installMode !== 'download') {
@@ -618,7 +724,13 @@ WantedBy=multi-user.target
           log.dim('    openfactu deploy         — Configurar acceso externo');
         }
         log.blank();
+        log.dim(`  Log de instalación: ${chalk.dim(path.join(targetDir, '.openfactu', 'install.log'))}`);
+        log.blank();
       } catch (err: any) {
+        logStep(`Error fatal: ${err.message}`, 'error');
+        try {
+          writeInstallLog(targetDir || os.homedir());
+        } catch {}
         log.error(err.message);
         process.exitCode = 1;
       }

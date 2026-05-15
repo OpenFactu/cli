@@ -23,6 +23,26 @@ function getLocalIPs(): string[] {
   return ips;
 }
 
+function checkPortInUse(port: number): { inUse: boolean; process?: string } {
+  try {
+    const output = execSync(`lsof -i :${port} -sTCP:LISTEN -t 2>/dev/null || ss -tlnp 'sport = :${port}' 2>/dev/null | grep -oP 'pid=\\K\\d+' || true`, {
+      stdio: 'pipe',
+    }).toString().trim();
+
+    if (output) {
+      const pid = output.split('\n')[0].trim();
+      let processName = 'desconocido';
+      try {
+        processName = execSync(`ps -p ${pid} -o comm= 2>/dev/null || echo 'desconocido'`, { stdio: 'pipe' }).toString().trim();
+      } catch {}
+      return { inUse: true, process: `${processName} (PID: ${pid})` };
+    }
+    return { inUse: false };
+  } catch {
+    return { inUse: false };
+  }
+}
+
 function readEnv(envPath: string): Record<string, string> {
   const env: Record<string, string> = {};
   if (!fs.existsSync(envPath)) return env;
@@ -136,6 +156,51 @@ export function registerDeployCommand(program: Command) {
             },
           ]);
           useSSL = ssl;
+        }
+
+        // Verificar conflictos de puertos si se usa SSL
+        let httpPort = '80';
+        let httpsPort = '443';
+
+        if (useSSL) {
+          const port80 = checkPortInUse(80);
+          const port443 = checkPortInUse(443);
+
+          if (port80.inUse || port443.inUse) {
+            log.blank();
+            log.warn('Puertos en conflicto detectados:');
+            if (port80.inUse) log.warn(`  Puerto 80: ocupado por ${port80.process}`);
+            if (port443.inUse) log.warn(`  Puerto 443: ocupado por ${port443.process}`);
+            log.blank();
+
+            const { portAction } = await inquirer.prompt([
+              {
+                type: 'list',
+                name: 'portAction',
+                message: '¿Cómo resolver el conflicto?',
+                choices: [
+                  { name: 'Usar puertos alternativos (8080/8443)', value: 'alternate' },
+                  { name: 'Especificar puertos personalizados', value: 'custom' },
+                  { name: 'Continuar con 80/443 (puede fallar)', value: 'continue' },
+                  { name: 'Desactivar HTTPS', value: 'nossl' },
+                ],
+              },
+            ]);
+
+            if (portAction === 'nossl') {
+              useSSL = false;
+            } else if (portAction === 'alternate') {
+              httpPort = '8080';
+              httpsPort = '8443';
+            } else if (portAction === 'custom') {
+              const { customHttp, customHttps } = await inquirer.prompt([
+                { type: 'input', name: 'customHttp', message: 'Puerto HTTP alternativo:', default: '8080' },
+                { type: 'input', name: 'customHttps', message: 'Puerto HTTPS alternativo:', default: '8443' },
+              ]);
+              httpPort = customHttp;
+              httpsPort = customHttps;
+            }
+          }
         }
 
         // Puertos
@@ -280,8 +345,8 @@ networks:
     image: caddy:2-alpine
     container_name: openfactu-caddy
     ports:
-      - "0.0.0.0:80:80"
-      - "0.0.0.0:443:443"
+      - "0.0.0.0:${httpPort}:80"
+      - "0.0.0.0:${httpsPort}:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -329,12 +394,15 @@ ${httpRedirect}`;
           if (isLAN) {
             log.info('Caddy generará certificado auto-firmado para la red local');
             log.dim('  Los navegadores mostrarán advertencia de seguridad (es normal)');
-            log.dim('  Puertos: 80 (HTTP) y 443 (HTTPS)');
           } else {
             log.info('Caddy obtendrá certificados Let\'s Encrypt automáticamente');
-            log.dim('  Asegúrate de que el puerto 80 y 443 estén abiertos');
             log.dim('  El DNS debe apuntar a este servidor');
             log.dim('  El primer request tardará unos segundos mientras se obtiene el certificado');
+          }
+          if (httpPort !== '80' || httpsPort !== '443') {
+            log.blank();
+            log.info(`Puertos alternativos: HTTP=${httpPort}, HTTPS=${httpsPort}`);
+            log.dim('  Asegúrate de abrir estos puertos en el firewall');
           }
         } else {
           prodSpinner.succeed('docker-compose.prod.yml generado');
@@ -504,7 +572,45 @@ networks:
         }
 
         const finalHost = opts.domain || host;
-        const httpsPort = opts.port || '443';
+        let httpsPort = opts.port || '443';
+        let httpPort = '80';
+
+        // Verificar conflictos de puertos
+        const port80 = checkPortInUse(80);
+        const port443 = checkPortInUse(443);
+
+        if (port80.inUse || port443.inUse) {
+          log.blank();
+          log.warn('Puertos en conflicto detectados:');
+          if (port80.inUse) log.warn(`  Puerto 80: ocupado por ${port80.process}`);
+          if (port443.inUse) log.warn(`  Puerto 443: ocupado por ${port443.process}`);
+          log.blank();
+
+          const { portAction } = await inquirer.prompt([
+            {
+              type: 'list',
+              name: 'portAction',
+              message: '¿Cómo resolver el conflicto?',
+              choices: [
+                { name: 'Usar puertos alternativos (8080/8443)', value: 'alternate' },
+                { name: 'Especificar puertos personalizados', value: 'custom' },
+                { name: 'Continuar con 80/443 (puede fallar)', value: 'continue' },
+              ],
+            },
+          ]);
+
+          if (portAction === 'alternate') {
+            httpPort = '8080';
+            httpsPort = '8443';
+          } else if (portAction === 'custom') {
+            const { customHttp, customHttps } = await inquirer.prompt([
+              { type: 'input', name: 'customHttp', message: 'Puerto HTTP alternativo:', default: '8080' },
+              { type: 'input', name: 'customHttps', message: 'Puerto HTTPS alternativo:', default: '8443' },
+            ]);
+            httpPort = customHttp;
+            httpsPort = customHttps;
+          }
+        }
 
         // Generar Caddyfile
         const tlsDirective = isLAN ? 'tls internal' : '';
@@ -546,7 +652,7 @@ ${httpRedirect}`;
     image: caddy:2-alpine
     container_name: openfactu-caddy
     ports:
-      - "0.0.0.0:80:80"
+      - "0.0.0.0:${httpPort}:80"
       - "0.0.0.0:${httpsPort}:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
@@ -580,6 +686,9 @@ volumes:
         log.success('HTTPS configurado');
         log.blank();
         log.info(`URL: ${chalk.cyan(webUrl)}`);
+        if (httpPort !== '80' || httpsPort !== '443') {
+          log.info(`Puertos: HTTP=${httpPort}, HTTPS=${httpsPort}`);
+        }
         if (isLAN) {
           log.dim('  Certificado auto-firmado (los navegadores mostrarán advertencia)');
         } else {

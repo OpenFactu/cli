@@ -107,6 +107,16 @@ export function registerDeployCommand(program: Command) {
           } else {
             host = selectedIP;
           }
+
+          const { ssl } = await inquirer.prompt([
+            {
+              type: 'confirm',
+              name: 'ssl',
+              message: '¿Usar HTTPS? (certificado auto-firmado para red local)',
+              default: false,
+            },
+          ]);
+          useSSL = ssl;
         } else if (mode === 'public') {
           const { domain } = await inquirer.prompt([
             {
@@ -263,43 +273,72 @@ networks:
     driver: bridge
 `;
 
-        // Si SSL, añadir nginx reverse proxy
+        // Si SSL, añadir Caddy reverse proxy con Let's Encrypt
         if (useSSL) {
           composeContent += `
-  # Para SSL, configura un reverse proxy (nginx, traefik, caddy) delante.
-  # Ejemplo con Caddy (descomentar):
-  #
-  # caddy:
-  #   image: caddy:2-alpine
-  #   ports:
-  #     - "0.0.0.0:80:80"
-  #     - "0.0.0.0:443:443"
-  #   volumes:
-  #     - ./Caddyfile:/etc/caddy/Caddyfile
-  #     - caddy_data:/data
-  #   depends_on:
-  #     - web
-  #     - server
-  #   networks:
-  #     - openfactu_net
-  #
-  # volumes:
-  #   caddy_data:
-  #
-  # Caddyfile:
-  #   ${host} {
-  #     handle /api/* {
-  #       reverse_proxy server:3000
-  #     }
-  #     handle {
-  #       reverse_proxy web:80
-  #     }
-  #   }
-`;
-        }
+  caddy:
+    image: caddy:2-alpine
+    container_name: openfactu-caddy
+    ports:
+      - "0.0.0.0:80:80"
+      - "0.0.0.0:443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+      - server
+    restart: unless-stopped
+    networks:
+      - openfactu_net
 
-        fs.writeFileSync(prodComposePath, composeContent);
-        prodSpinner.succeed('docker-compose.prod.yml generado');
+volumes:
+  caddy_data:
+  caddy_config:
+`;
+          // Generar Caddyfile
+          const caddyfilePath = path.join(root, 'Caddyfile');
+          const isLAN = mode === 'lan';
+          const tlsDirective = isLAN ? 'tls internal' : '';
+          const httpRedirect = isLAN ? '' : `
+http://${host} {
+    redir https://{host}{uri} permanent
+}
+`;
+          const caddyfileContent = `${host} {
+    ${tlsDirective}
+    encode gzip
+
+    handle /api/* {
+        reverse_proxy server:3000
+    }
+
+    handle {
+        reverse_proxy web:80
+    }
+
+    log {
+        output file /var/log/caddy/access.log
+    }
+}
+${httpRedirect}`;
+          fs.writeFileSync(caddyfilePath, caddyfileContent);
+          prodSpinner.succeed('docker-compose.prod.yml y Caddyfile generados');
+          log.blank();
+          if (isLAN) {
+            log.info('Caddy generará certificado auto-firmado para la red local');
+            log.dim('  Los navegadores mostrarán advertencia de seguridad (es normal)');
+            log.dim('  Puertos: 80 (HTTP) y 443 (HTTPS)');
+          } else {
+            log.info('Caddy obtendrá certificados Let\'s Encrypt automáticamente');
+            log.dim('  Asegúrate de que el puerto 80 y 443 estén abiertos');
+            log.dim('  El DNS debe apuntar a este servidor');
+            log.dim('  El primer request tardará unos segundos mientras se obtiene el certificado');
+          }
+        } else {
+          prodSpinner.succeed('docker-compose.prod.yml generado');
+        }
 
         // Generar docker-compose.prod.monitoring.yml si se pidió monitoreo
         if (opts.withMonitoring) {
@@ -414,7 +453,9 @@ networks:
         } else if (mode === 'public') {
           log.info('Asegúrate de que los puertos estén abiertos en el firewall');
           if (useSSL) {
-            log.info('Configura el reverse proxy (Caddy/Nginx) para SSL');
+            log.info('Caddy obtendrá certificado Let\'s Encrypt automáticamente');
+            log.dim('  El DNS debe apuntar a este servidor para que funcione');
+            log.dim('  Puertos requeridos: 80 (HTTP) y 443 (HTTPS)');
           }
         }
 
@@ -424,6 +465,151 @@ networks:
         log.dim(`  docker compose -f docker-compose.prod.yml down       — Parar`);
         log.dim(`  docker compose -f docker-compose.prod.yml restart    — Reiniciar`);
         log.blank();
+      } catch (err: any) {
+        log.error(err.message);
+        process.exitCode = 1;
+      }
+    });
+
+  // ── openfactu deploy:ssl ──
+  program
+    .command('deploy:ssl')
+    .description('Activa HTTPS en un despliegue existente con Caddy')
+    .option('--domain <domain>', 'Dominio para el certificado')
+    .option('--lan', 'Usar certificado auto-firmado para red local')
+    .option('--port <port>', 'Puerto HTTPS (default: 443)', '443')
+    .action(async (opts) => {
+      console.log();
+      console.log(chalk.bold.white('  OpenFactu — Activar HTTPS'));
+      console.log(chalk.dim('  ────────────────────────────────────'));
+      console.log();
+
+      try {
+        const root = getProjectRoot();
+        const envPath = path.join(root, '.env');
+        const env = readEnv(envPath);
+        const host = opts.domain || env.HOST || 'localhost';
+        const isLAN = opts.lan || false;
+
+        if (!isLAN && !opts.domain) {
+          const { domain } = await inquirer.prompt([
+            {
+              type: 'input',
+              name: 'domain',
+              message: 'Dominio para el certificado Let\'s Encrypt:',
+              default: host,
+            },
+          ]);
+          opts.domain = domain;
+        }
+
+        const finalHost = opts.domain || host;
+        const httpsPort = opts.port || '443';
+
+        // Generar Caddyfile
+        const tlsDirective = isLAN ? 'tls internal' : '';
+        const httpRedirect = isLAN ? '' : `
+http://${finalHost} {
+    redir https://${finalHost}{uri} permanent
+}
+`;
+        const caddyfileContent = `${finalHost} {
+    ${tlsDirective}
+    encode gzip
+
+    handle /api/* {
+        reverse_proxy server:3000
+    }
+
+    handle {
+        reverse_proxy web:80
+    }
+
+    log {
+        output file /var/log/caddy/access.log
+    }
+}
+${httpRedirect}`;
+
+        const caddyfilePath = path.join(root, 'Caddyfile');
+        fs.writeFileSync(caddyfilePath, caddyfileContent);
+
+        // Actualizar docker-compose.prod.yml para añadir Caddy
+        const prodComposePath = path.join(root, 'docker-compose.prod.yml');
+        let composeContent = fs.existsSync(prodComposePath)
+          ? fs.readFileSync(prodComposePath, 'utf-8')
+          : '';
+
+        if (!composeContent.includes('caddy:')) {
+          composeContent += `
+  caddy:
+    image: caddy:2-alpine
+    container_name: openfactu-caddy
+    ports:
+      - "0.0.0.0:80:80"
+      - "0.0.0.0:${httpsPort}:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+      - server
+    restart: unless-stopped
+    networks:
+      - openfactu_net
+
+volumes:
+  caddy_data:
+  caddy_config:
+`;
+          fs.writeFileSync(prodComposePath, composeContent);
+        }
+
+        // Actualizar .env
+        const protocol = 'https';
+        const webUrl = httpsPort === '443'
+          ? `${protocol}://${finalHost}`
+          : `${protocol}://${finalHost}:${httpsPort}`;
+        env.VITE_API_URL = webUrl;
+        env.CORS_ORIGIN = webUrl;
+        env.HOST = finalHost;
+        writeEnv(envPath, env);
+
+        log.blank();
+        log.success('HTTPS configurado');
+        log.blank();
+        log.info(`URL: ${chalk.cyan(webUrl)}`);
+        if (isLAN) {
+          log.dim('  Certificado auto-firmado (los navegadores mostrarán advertencia)');
+        } else {
+          log.dim('  Caddy obtendrá certificado Let\'s Encrypt en el primer request');
+          log.dim('  El DNS debe apuntar a este servidor');
+        }
+        log.blank();
+
+        const { restart } = await inquirer.prompt([
+          {
+            type: 'confirm',
+            name: 'restart',
+            message: '¿Reiniciar servicios para aplicar HTTPS?',
+            default: true,
+          },
+        ]);
+
+        if (restart) {
+          const spinner = ora('Reiniciando servicios...').start();
+          try {
+            execSync('docker compose -f docker-compose.prod.yml up -d', {
+              cwd: root,
+              stdio: 'pipe',
+              timeout: 120000,
+            });
+            spinner.succeed('Servicios reiniciados');
+          } catch (err: any) {
+            spinner.fail('Error: ' + err.message);
+          }
+        }
       } catch (err: any) {
         log.error(err.message);
         process.exitCode = 1;

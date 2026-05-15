@@ -12,11 +12,11 @@ export function registerInstallScriptCommand(program: Command) {
   program
     .command('install:script')
     .description('Generar script de instalacion standalone (sin CLI)')
-    .option('--output <file>', 'Archivo de salida', './install-openfactu.sh')
+    .option('-o, --output <file>', 'Archivo de salida', './install-openfactu.sh')
     .option('--tag <tag>', 'Version fija en el script')
     .option('--dir <dir>', 'Directorio por defecto')
-    .option('--include-monitoring', 'Incluir opcion de monitoreo en el script')
-    .option('--include-service', 'Incluir opcion de servicio systemd en el script')
+    .option('-m, --monitoring', 'Incluir opcion de monitoreo en el script')
+    .option('-s, --service', 'Incluir opcion de servicio systemd en el script')
     .action(async (opts) => {
       console.log();
       console.log(chalk.bold.white('  OpenFactu — Generar Script de Instalacion'));
@@ -26,8 +26,8 @@ export function registerInstallScriptCommand(program: Command) {
       try {
         const tag = opts.tag || '${TAG:-latest}';
         const defaultDir = opts.dir || '$HOME/openfactu';
-        const includeMonitoring = opts.includeMonitoring || false;
-        const includeService = opts.includeService || false;
+        const includeMonitoring = opts.monitoring || false;
+        const includeService = opts.service || false;
 
         if (!opts.output.includes('.sh')) {
           opts.output += '.sh';

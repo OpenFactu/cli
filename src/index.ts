@@ -14,6 +14,7 @@ import { registerBackupCommand } from './commands/backup';
 import { registerDoctorCommand } from './commands/doctor';
 import { registerInstallQuickCommand } from './commands/install-quick';
 import { registerInstallScriptCommand } from './commands/install-script';
+import { registerSyncPortsCommand } from './commands/sync-ports';
 
 export function createCLI() {
   const program = new Command();
@@ -32,6 +33,7 @@ export function createCLI() {
   registerInstallCommand(program);
   registerInstallQuickCommand(program);
   registerInstallScriptCommand(program);
+  registerSyncPortsCommand(program);
   registerDeployCommand(program);
   registerMonitoringCommand(program);
   registerServiceCommand(program);

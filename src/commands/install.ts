@@ -150,6 +150,54 @@ function generateEnvConfig(targetDir: string): Record<string, string> {
   };
 }
 
+function generateEnvFileContent(envConfig: Record<string, string>): string {
+  return `# ============================================================
+# OpenFactu - Configuración
+# Generado automáticamente por @openfactu/cli
+# ============================================================
+# IMPORTANTE: Revisa y ajusta los valores marcados con [EDITAR]
+# ============================================================
+
+# ── Base de datos ──────────────────────────────────────────
+# [EDITAR] Si cambias el puerto de PostgreSQL, actualiza DATABASE_URL
+POSTGRES_USER=${envConfig.POSTGRES_USER}
+POSTGRES_PASSWORD=${envConfig.POSTGRES_PASSWORD}
+POSTGRES_DB=${envConfig.POSTGRES_DB}
+DB_PORT=${envConfig.DB_PORT}
+
+# [EDITAR] La URL interna del contenedor (no cambiar a menos que uses otro host de BD)
+DATABASE_URL=${envConfig.DATABASE_URL}
+
+# ── Puertos de la aplicación ───────────────────────────────
+# [EDITAR] Cambia estos puertos si hay conflictos en tu servidor
+SERVER_PORT=${envConfig.SERVER_PORT}
+WEB_PORT=${envConfig.WEB_PORT}
+
+# ── Seguridad ─────────────────────────────────────────────
+# [NO EDITAR] Secrets generados automáticamente
+JWT_SECRET=${envConfig.JWT_SECRET}
+SESSION_SECRET=${envConfig.SESSION_SECRET}
+
+# ── Entorno ────────────────────────────────────────────────
+NODE_ENV=${envConfig.NODE_ENV}
+
+# ── URLs y acceso externo ──────────────────────────────────
+# [EDITAR] Cambia HOST por tu dominio o IP pública
+HOST=${envConfig.HOST}
+
+# [EDITAR] Cambia estas URLs según tu dominio/IP y puertos
+# Ejemplo con dominio: https://erp.miempresa.com
+# Ejemplo con IP: http://192.168.1.100:8080
+CORS_ORIGIN=${envConfig.CORS_ORIGIN}
+VITE_API_URL=${envConfig.VITE_API_URL}
+
+# ── Credenciales de administrador ──────────────────────────
+# [EDITAR] Cambia el email y password del admin inicial
+ADMIN_EMAIL=${envConfig.ADMIN_EMAIL}
+ADMIN_PASSWORD=${envConfig.ADMIN_PASSWORD}
+`;
+}
+
 function installService(targetDir: string, dockerCmd: string, serviceName: string, unitPath: string) {
   const unitContent = `[Unit]
 Description=OpenFactu ERP Platform
@@ -551,6 +599,140 @@ export function registerInstallCommand(program: Command) {
         const dockerCmd = getDockerComposeCommand();
         logStep(`Modo de instalación: ${installMode}`, 'info');
 
+        // Verificar conflictos de puertos antes de levantar contenedores
+        if (installMode === 'full' || installMode === 'docker' || installMode === 'minimal') {
+          const commonPorts = [
+            { port: 5432, name: 'PostgreSQL', container: 'db' },
+            { port: 8080, name: 'Web', container: 'web' },
+            { port: 3000, name: 'API Server', container: 'server' },
+          ];
+
+          const conflicts = commonPorts.filter(p => {
+            try {
+              execSync(`lsof -i :${p.port} -sTCP:LISTEN -t 2>/dev/null || ss -tlnp 'sport = :${p.port}' 2>/dev/null | grep -oP 'pid=\\K\\d+' || true`, { stdio: 'pipe' });
+              return true;
+            } catch {
+              return false;
+            }
+          });
+
+          if (conflicts.length > 0 && !nonInteractive) {
+            log.blank();
+            log.warn('Puertos en conflicto detectados:');
+            for (const c of conflicts) {
+              let processInfo = '';
+              try {
+                const pid = execSync(`lsof -i :${c.port} -sTCP:LISTEN -t 2>/dev/null | head -1 || true`, { stdio: 'pipe' }).toString().trim();
+                if (pid) {
+                  const procName = execSync(`ps -p ${pid} -o comm= 2>/dev/null || echo 'desconocido'`, { stdio: 'pipe' }).toString().trim();
+                  processInfo = ` (${procName})`;
+                }
+              } catch {}
+              log.warn(`  Puerto ${c.port} (${c.name}): ocupado${processInfo}`);
+            }
+            log.blank();
+
+            const { portAction } = await inquirer.prompt([
+              {
+                type: 'list',
+                name: 'portAction',
+                message: '¿Cómo resolver el conflicto?',
+                choices: [
+                  { name: 'Detener el proceso que ocupa el puerto', value: 'stop' },
+                  { name: 'Usar puertos alternativos (5433, 8081, 3001)', value: 'alternate' },
+                  { name: 'Continuar igual (puede fallar)', value: 'continue' },
+                  { name: 'Cancelar instalación', value: 'cancel' },
+                ],
+              },
+            ]);
+
+            if (portAction === 'cancel') {
+              log.info('Instalación cancelada');
+              writeInstallLog(targetDir);
+              return;
+            }
+
+            if (portAction === 'stop') {
+              for (const c of conflicts) {
+                const stopSpinner = ora(`Deteniendo proceso en puerto ${c.port}...`).start();
+                try {
+                  const pid = execSync(`lsof -i :${c.port} -sTCP:LISTEN -t 2>/dev/null | head -1`, { stdio: 'pipe' }).toString().trim();
+                  if (pid) {
+                    execSync(`kill -9 ${pid} 2>/dev/null || true`, { stdio: 'pipe' });
+                    stopSpinner.succeed(`Proceso en puerto ${c.port} detenido`);
+                    logStep(`Puerto ${c.port} liberado`, 'success');
+                  } else {
+                    stopSpinner.warn(`No se encontró proceso en puerto ${c.port}`);
+                  }
+                } catch {
+                  stopSpinner.fail(`No se pudo detener el proceso en puerto ${c.port}`);
+                  log.dim(`  Intenta manualmente: sudo lsof -i :${c.port} -t | xargs kill -9`);
+                }
+              }
+              log.blank();
+            }
+
+            if (portAction === 'alternate') {
+              const portMap: Record<number, number> = { 5432: 5433, 8080: 8081, 3000: 3001 };
+
+              // Actualizar .env
+              const envPath = path.join(targetDir, '.env');
+              if (fs.existsSync(envPath)) {
+                let envContent = fs.readFileSync(envPath, 'utf-8');
+                for (const [oldPort, newPort] of Object.entries(portMap)) {
+                  const oldPortNum = parseInt(oldPort);
+                  if (conflicts.some(c => c.port === oldPortNum)) {
+                    envContent = envContent.replace(new RegExp(`:${oldPortNum}\\b`, 'g'), `:${newPort}`);
+                    envContent = envContent.replace(new RegExp(`PORT=${oldPortNum}`, 'g'), `PORT=${newPort}`);
+                    log.info(`Puerto ${oldPort} → ${newPort}`);
+                  }
+                }
+                fs.writeFileSync(envPath, envContent);
+                logStep('Puertos alternativos configurados en .env', 'success');
+              }
+
+              // Actualizar docker-compose files
+              const composeFiles = [
+                'docker-compose.yml',
+                'docker-compose.prod.yml',
+              ];
+
+              for (const composeFile of composeFiles) {
+                const composePath = path.join(targetDir, composeFile);
+                if (fs.existsSync(composePath)) {
+                  let composeContent = fs.readFileSync(composePath, 'utf-8');
+                  for (const [oldPort, newPort] of Object.entries(portMap)) {
+                    const oldPortNum = parseInt(oldPort);
+                    if (conflicts.some(c => c.port === oldPortNum)) {
+                      // Reemplazar puertos en mappings de Docker "host:container"
+                      composeContent = composeContent.replace(
+                        new RegExp(`"([^"]*):${oldPortNum}"`, 'g'),
+                        `$1:${newPort}"`
+                      );
+                      composeContent = composeContent.replace(
+                        new RegExp(`- "${oldPortNum}:${oldPortNum}"`, 'g'),
+                        `- "${newPort}:${oldPortNum}"`
+                      );
+                      composeContent = composeContent.replace(
+                        new RegExp(`- "0\\.0\\.0\\.0:${oldPortNum}:`, 'g'),
+                        `- "0.0.0.0:${newPort}:`
+                      );
+                      composeContent = composeContent.replace(
+                        new RegExp(`- "127\\.0\\.0\\.1:${oldPortNum}:`, 'g'),
+                        `- "127.0.0.1:${newPort}:`
+                      );
+                    }
+                  }
+                  fs.writeFileSync(composePath, composeContent);
+                  logStep(`Puertos actualizados en ${composeFile}`, 'success');
+                }
+              }
+
+              log.blank();
+            }
+          }
+        }
+
         if (installMode === 'full' || installMode === 'docker' || installMode === 'minimal') {
           if (installMode === 'full' || installMode === 'docker') {
             const dockerSpinner = ora('Construyendo contenedores Docker...').start();
@@ -726,6 +908,96 @@ export function registerInstallCommand(program: Command) {
               } else {
                 log.dim('  Ejecuta: sudo usermod -aG docker $USER');
                 log.dim('  Luego cierra sesión y vuelve a entrar');
+              }
+            } else if (err.message?.includes('Bind for') && err.message?.includes('port is already allocated')) {
+              // Detectar error de puerto ocupado
+              log.blank();
+              log.warn('Puerto ocupado detectado');
+              const portMatch = err.message.match(/Bind for [\d.]+:(\d+)/);
+              const occupiedPort = portMatch ? portMatch[1] : 'desconocido';
+              log.warn(`  Puerto ${occupiedPort} ya está en uso`);
+              log.blank();
+
+              if (!nonInteractive) {
+                const { portAction } = await inquirer.prompt([
+                  {
+                    type: 'list',
+                    name: 'portAction',
+                    message: '¿Cómo resolverlo?',
+                    choices: [
+                      { name: 'Detener el proceso que ocupa el puerto', value: 'stop' },
+                      { name: 'Cambiar puerto en .env y reintentar', value: 'change' },
+                      { name: 'Cancelar', value: 'cancel' },
+                    ],
+                  },
+                ]);
+
+                if (portAction === 'cancel') {
+                  log.info('Instalación cancelada');
+                  writeInstallLog(targetDir);
+                  return;
+                }
+
+                if (portAction === 'stop') {
+                  const stopSpinner = ora(`Deteniendo proceso en puerto ${occupiedPort}...`).start();
+                  try {
+                    const pid = execSync(`lsof -i :${occupiedPort} -sTCP:LISTEN -t 2>/dev/null | head -1`, { stdio: 'pipe' }).toString().trim();
+                    if (pid) {
+                      execSync(`kill -9 ${pid} 2>/dev/null || true`, { stdio: 'pipe' });
+                      stopSpinner.succeed(`Proceso detenido`);
+                      logStep(`Puerto ${occupiedPort} liberado`, 'success');
+
+                      const { retry } = await inquirer.prompt([
+                        { type: 'confirm', name: 'retry', message: '¿Reintentar levantar servicios?', default: true },
+                      ]);
+                      if (retry) {
+                        const retrySpinner = ora('Reintentando...').start();
+                        try {
+                          execSync(`${dockerCmd} ${composeFiles} up -d`, { cwd: targetDir, stdio: 'pipe', timeout: 120000 });
+                          retrySpinner.succeed('Servicios levantados');
+                          logStep('Servicios levantados tras liberar puerto', 'success');
+                        } catch {
+                          retrySpinner.fail('Aún hay error');
+                        }
+                      }
+                    } else {
+                      stopSpinner.warn('No se encontró el proceso');
+                    }
+                  } catch {
+                    stopSpinner.fail('No se pudo detener el proceso');
+                    log.dim(`  Manual: sudo lsof -i :${occupiedPort} -t | xargs kill -9`);
+                  }
+                }
+
+                if (portAction === 'change') {
+                  const envPath = path.join(targetDir, '.env');
+                  if (fs.existsSync(envPath)) {
+                    const { newPort } = await inquirer.prompt([
+                      { type: 'input', name: 'newPort', message: `Nuevo puerto para reemplazar ${occupiedPort}:`, default: String(parseInt(occupiedPort) + 1) },
+                    ]);
+                    let envContent = fs.readFileSync(envPath, 'utf-8');
+                    envContent = envContent.replace(new RegExp(`:${occupiedPort}\\b`, 'g'), `:${newPort}`);
+                    envContent = envContent.replace(new RegExp(`PORT=${occupiedPort}`, 'g'), `PORT=${newPort}`);
+                    fs.writeFileSync(envPath, envContent);
+                    log.success(`Puerto cambiado a ${newPort} en .env`);
+                    logStep(`Puerto ${occupiedPort} → ${newPort}`, 'success');
+
+                    const { retry } = await inquirer.prompt([
+                      { type: 'confirm', name: 'retry', message: '¿Reintentar levantar servicios?', default: true },
+                    ]);
+                    if (retry) {
+                      const retrySpinner = ora('Reintentando...').start();
+                      try {
+                        execSync(`${dockerCmd} ${composeFiles} up -d`, { cwd: targetDir, stdio: 'pipe', timeout: 120000 });
+                        retrySpinner.succeed('Servicios levantados');
+                      } catch {
+                        retrySpinner.fail('Aún hay error');
+                      }
+                    }
+                  }
+                }
+              } else {
+                log.dim(`  Puerto ${occupiedPort} ocupado. Cambia el puerto en .env o detén el proceso.`);
               }
             } else {
               log.dim(`  cd ${targetDir} && ${dockerCmd} up -d`);

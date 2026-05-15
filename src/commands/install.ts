@@ -562,7 +562,69 @@ export function registerInstallCommand(program: Command) {
             } catch (err: any) {
               dockerSpinner.fail('Error en build: ' + err.message);
               logStep(`Error en build de Docker: ${err.message}`, 'error');
-              log.dim(`  Ejecuta manualmente: cd ${targetDir} && ${dockerCmd} build`);
+
+              // Detectar error de permisos de Docker
+              if (err.message?.includes('permission denied') && err.message?.includes('docker.sock')) {
+                log.blank();
+                log.warn('Error de permisos de Docker detectado');
+                log.dim('  Tu usuario no tiene acceso al socket de Docker');
+                log.blank();
+
+                if (!nonInteractive) {
+                  const { fixPermissions } = await inquirer.prompt([
+                    {
+                      type: 'confirm',
+                      name: 'fixPermissions',
+                      message: '¿Agregar tu usuario al grupo docker para arreglarlo? (requiere sudo)',
+                      default: true,
+                    },
+                  ]);
+
+                  if (fixPermissions) {
+                    const fixSpinner = ora('Agregando usuario al grupo docker...').start();
+                    logStep('Arreglando permisos de Docker', 'info');
+                    try {
+                      const user = process.env.USER || process.env.USERNAME || 'root';
+                      execSync(`sudo usermod -aG docker ${user}`, { stdio: 'pipe' });
+                      fixSpinner.succeed('Usuario agregado al grupo docker');
+                      logStep('Permisos de Docker arreglados', 'success');
+                      log.blank();
+                      log.info('Los cambios se aplican en la próxima sesión');
+                      log.dim(`  Ejecuta: newgrp docker`);
+                      log.dim(`  O cierra sesión y vuelve a entrar`);
+                      log.blank();
+
+                      const { retryBuild } = await inquirer.prompt([
+                        {
+                          type: 'confirm',
+                          name: 'retryBuild',
+                          message: '¿Reintentar el build ahora?',
+                          default: false,
+                        },
+                      ]);
+
+                      if (retryBuild) {
+                        const retrySpinner = ora('Reintentando build...').start();
+                        try {
+                          execSync(`${dockerCmd} build`, { cwd: targetDir, stdio: 'pipe', timeout: 300000 });
+                          retrySpinner.succeed('Build completado');
+                          logStep('Build completado tras arreglar permisos', 'success');
+                        } catch {
+                          retrySpinner.warn('Aún hay error de permisos');
+                          logStep('Reintento de build fallido', 'warn');
+                        }
+                      }
+                    } catch (fixErr: any) {
+                      fixSpinner.fail('No se pudieron arreglar los permisos');
+                      logStep(`Error arreglando permisos: ${fixErr.message}`, 'error');
+                      log.dim('  Ejecuta manualmente: sudo usermod -aG docker $USER');
+                    }
+                  }
+                } else {
+                  log.dim('  Ejecuta: sudo usermod -aG docker $USER');
+                }
+              }
+
               log.blank();
               const { continueWithoutBuild } = await inquirer.prompt([
                 {
@@ -582,26 +644,92 @@ export function registerInstallCommand(program: Command) {
 
           const upSpinner = ora('Levantando servicios...').start();
           logStep('Levantando servicios Docker', 'info');
+          let composeFiles = '-f docker-compose.yml';
+          if (fs.existsSync(path.join(targetDir, 'docker-compose.prod.yml'))) {
+            composeFiles = '-f docker-compose.prod.yml';
+          }
+
+          if (includeMonitoring) {
+            const monPath = path.join(targetDir, 'docker-compose.monitoring.yml');
+            if (fs.existsSync(monPath)) {
+              composeFiles += ` -f docker-compose.monitoring.yml`;
+            }
+          }
+
           try {
-            let composeFiles = '-f docker-compose.yml';
-            if (fs.existsSync(path.join(targetDir, 'docker-compose.prod.yml'))) {
-              composeFiles = '-f docker-compose.prod.yml';
-            }
-
-            if (includeMonitoring) {
-              const monPath = path.join(targetDir, 'docker-compose.monitoring.yml');
-              if (fs.existsSync(monPath)) {
-                composeFiles += ` -f docker-compose.monitoring.yml`;
-              }
-            }
-
             execSync(`${dockerCmd} ${composeFiles} up -d`, { cwd: targetDir, stdio: 'pipe', timeout: 120000 });
             upSpinner.succeed('Servicios levantados');
             logStep('Servicios Docker levantados', 'success');
           } catch (err: any) {
             upSpinner.fail('Error: ' + err.message);
             logStep(`Error levantando servicios: ${err.message}`, 'error');
-            log.dim(`  cd ${targetDir} && ${dockerCmd} up -d`);
+
+            // Detectar error de permisos de Docker
+            if (err.message?.includes('permission denied') && err.message?.includes('docker.sock')) {
+              log.blank();
+              log.warn('Error de permisos de Docker detectado');
+              log.dim('  Tu usuario no tiene acceso al socket de Docker');
+              log.blank();
+
+              if (!nonInteractive) {
+                const { fixPermissions } = await inquirer.prompt([
+                  {
+                    type: 'confirm',
+                    name: 'fixPermissions',
+                    message: '¿Agregar tu usuario al grupo docker para arreglarlo? (requiere sudo)',
+                    default: true,
+                  },
+                ]);
+
+                if (fixPermissions) {
+                  const fixSpinner = ora('Agregando usuario al grupo docker...').start();
+                  logStep('Arreglando permisos de Docker', 'info');
+                  try {
+                    const user = process.env.USER || process.env.USERNAME || 'root';
+                    execSync(`sudo usermod -aG docker ${user}`, { stdio: 'pipe' });
+                    fixSpinner.succeed('Usuario agregado al grupo docker');
+                    logStep('Permisos de Docker arreglados', 'success');
+                    log.blank();
+                    log.info('Los cambios se aplican en la próxima sesión');
+                    log.dim(`  Ejecuta: newgrp docker`);
+                    log.dim(`  O cierra sesión y vuelve a entrar`);
+                    log.blank();
+
+                    const { retryNow } = await inquirer.prompt([
+                      {
+                        type: 'confirm',
+                        name: 'retryNow',
+                        message: '¿Intentar levantar los servicios ahora? (puede fallar hasta que apliquen los permisos)',
+                        default: false,
+                      },
+                    ]);
+
+                    if (retryNow) {
+                      const retrySpinner = ora('Reintentando...').start();
+                      try {
+                        execSync(`${dockerCmd} ${composeFiles} up -d`, { cwd: targetDir, stdio: 'pipe', timeout: 120000 });
+                        retrySpinner.succeed('Servicios levantados');
+                        logStep('Servicios levantados tras arreglar permisos', 'success');
+                      } catch (retryErr: any) {
+                        retrySpinner.warn('Aún hay error de permisos');
+                        logStep('Reintento fallido, permisos no aplicados aún', 'warn');
+                        log.dim('  Cierra sesión y vuelve a entrar, luego ejecuta:');
+                        log.dim(`  cd ${targetDir} && ${dockerCmd} up -d`);
+                      }
+                    }
+                  } catch (fixErr: any) {
+                    fixSpinner.fail('No se pudieron arreglar los permisos');
+                    logStep(`Error arreglando permisos: ${fixErr.message}`, 'error');
+                    log.dim('  Ejecuta manualmente: sudo usermod -aG docker $USER');
+                  }
+                }
+              } else {
+                log.dim('  Ejecuta: sudo usermod -aG docker $USER');
+                log.dim('  Luego cierra sesión y vuelve a entrar');
+              }
+            } else {
+              log.dim(`  cd ${targetDir} && ${dockerCmd} up -d`);
+            }
           }
 
           // Health checks

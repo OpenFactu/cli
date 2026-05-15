@@ -3,7 +3,6 @@ import chalk from 'chalk';
 import ora from 'ora';
 import inquirer from 'inquirer';
 import crypto from 'crypto';
-import bcrypt from 'bcrypt';
 import { getPublicDb, testConnection, disconnect, schema as getSchema, sql, eq } from '../utils/db';
 import { log } from '../utils/logger';
 
@@ -68,7 +67,12 @@ export function registerSetupCommand(program: Command) {
             },
           ]);
 
-          const hashedPassword = await bcrypt.hash(adminPassword, 10);
+          const hashedPassword = await new Promise<string>((resolve, reject) => {
+            crypto.scrypt(adminPassword, 'openfactu-salt', 64, (err, derivedKey) => {
+              if (err) reject(err);
+              resolve(derivedKey.toString('hex'));
+            });
+          });
           await publicDb.insert(getSchema().globalUsers).values({
             id: crypto.randomUUID(),
             email: 'admin@openfactu.com',

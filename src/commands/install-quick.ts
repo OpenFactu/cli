@@ -1,6 +1,7 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
+import inquirer from 'inquirer';
 import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -28,7 +29,7 @@ export function registerInstallQuickCommand(program: Command) {
       console.log();
 
       try {
-        const targetDir = opts.dir || path.join(os.homedir(), 'openfactu');
+        let targetDir = opts.dir || path.join(os.homedir(), 'openfactu');
         const dockerCmd = getDockerComposeCommand();
 
         // Check Docker
@@ -71,6 +72,54 @@ export function registerInstallQuickCommand(program: Command) {
         }
 
         const isTag = ref.startsWith('v');
+
+        // Verificar si el directorio ya existe
+        if (fs.existsSync(targetDir)) {
+          const contents = fs.readdirSync(targetDir);
+          if (contents.length > 0) {
+            log.warn(`El directorio ${targetDir} ya existe y no esta vacio`);
+            const { action } = await inquirer.prompt([
+              {
+                type: 'list',
+                name: 'action',
+                message: 'Que quieres hacer?',
+                choices: [
+                  { name: 'Sobrescribir (eliminar y reinstalar)', value: 'overwrite' },
+                  { name: 'Usar directorio existente (solo configurar)', value: 'reuse' },
+                  { name: 'Elegir otro directorio', value: 'newdir' },
+                  { name: 'Cancelar', value: 'cancel' },
+                ],
+              },
+            ]);
+
+            if (action === 'cancel') {
+              log.info('Instalacion cancelada');
+              return;
+            }
+
+            if (action === 'overwrite') {
+              const removeSpinner = ora('Limpiando directorio...').start();
+              execSync(`rm -rf "${targetDir}"`, { stdio: 'pipe' });
+              fs.mkdirSync(targetDir, { recursive: true });
+              removeSpinner.succeed('Directorio limpiado');
+            }
+
+            if (action === 'newdir') {
+              const { newDir } = await inquirer.prompt([
+                { type: 'input', name: 'newDir', message: 'Nuevo directorio:', default: path.join(os.homedir(), 'openfactu-2') },
+              ]);
+              targetDir = path.resolve(newDir);
+              fs.mkdirSync(targetDir, { recursive: true });
+            }
+
+            if (action === 'reuse') {
+              log.info('Usando directorio existente');
+            }
+          }
+        } else {
+          fs.mkdirSync(targetDir, { recursive: true });
+        }
+
         const cloneCmd = isTag
           ? `git clone --depth 1 --branch ${ref} ${REPO_URL} "${targetDir}"`
           : `git clone --branch ${ref} ${REPO_URL} "${targetDir}"`;
@@ -79,8 +128,12 @@ export function registerInstallQuickCommand(program: Command) {
           execSync(cloneCmd, { stdio: 'pipe', timeout: 120000 });
           cloneSpinner.succeed('Repositorio clonado');
         } catch (err: any) {
-          cloneSpinner.fail('Error al clonar: ' + err.message);
-          return;
+          if (err.message?.includes('ya existe') || err.message?.includes('already exists')) {
+            cloneSpinner.warn('Directorio ya existe, usando existente');
+          } else {
+            cloneSpinner.fail('Error al clonar: ' + err.message);
+            return;
+          }
         }
 
         // Generate .env

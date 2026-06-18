@@ -41,8 +41,8 @@ describe('CLI Integration', () => {
     expect(output).toContain('--output');
     expect(output).toContain('--tag');
     expect(output).toContain('--dir');
-    expect(output).toContain('--include-monitoring');
-    expect(output).toContain('--include-service');
+    expect(output).toContain('--monitoring');
+    expect(output).toContain('--service');
   });
 
   it('muestra ayuda del comando service', () => {

@@ -24,7 +24,7 @@ openfactu doctor               # Diagnostico del entorno
 
 | Comando | Descripcion |
 |---------|-------------|
-| `openfactu install [dir]` | Wizard completo: version, modo, Docker, monitoreo, servicio |
+| `openfactu install [dir]` | Wizard completo: version, modo, Docker, contraseña BD, monitoreo (selección de servicios), servicio |
 | `openfactu install:quick` | Instalacion rapida non-interactive |
 | `openfactu install:script` | Generar script shell standalone para instalar sin CLI |
 | `openfactu update` | Actualiza sin perder datos |
@@ -37,13 +37,22 @@ openfactu doctor               # Diagnostico del entorno
 openfactu install --tag v1.0.0           # Version especifica
 openfactu install --branch develop       # Desde branch
 openfactu install --mode full            # Modo: full, docker, minimal, download
-openfactu install --generate-env         # Credenciales seguras aleatorias
-openfactu install --monitoring           # Incluir stack de monitoreo
-openfactu install --with-analytics       # Incluir analitica completa (Loki, cAdvisor, Node Exporter)
+openfactu install --generate-env         # No preguntar: genera credenciales aleatorias
+openfactu install --monitoring           # Monitoreo: set basico (pgAdmin, Grafana, Prometheus, Portainer)
+openfactu install --with-analytics       # Monitoreo: set completo (+ Loki, Promtail, cAdvisor, Node Exporter)
 openfactu install --service              # Instalar como servicio systemd
 openfactu install -y                     # Non-interactive, acepta defaults
 openfactu install --no-preflight         # Saltar chequeos previos
 ```
+
+> **Credenciales:** en modo interactivo, `install` pide la **contraseña de PostgreSQL**
+> (pulsa Enter para generar una segura) y escribe un `.env` completo **antes** del primer
+> arranque, de modo que Postgres se inicializa con ella. `deploy` reutiliza esa contraseña;
+> cambiarla luego no afecta a un volumen ya creado.
+>
+> **Monitoreo:** si activas monitoreo en modo interactivo, eliges con un **checkbox** qué
+> servicios instalar (pgAdmin, Grafana, Prometheus, Loki, Promtail, cAdvisor, Node Exporter,
+> Portainer, Alertmanager). Con `--monitoring`/`--with-analytics` se usan sets predefinidos.
 
 #### Modos de instalacion
 

@@ -30,12 +30,32 @@ describe('generatePassword', () => {
     expect(passwords.size).toBe(10);
   });
 
-  it('incluye caracteres variados', () => {
-    const password = generatePassword(100);
+  it('incluye letras y numeros', () => {
+    const password = generatePassword(200);
     expect(password).toMatch(/[a-z]/);
     expect(password).toMatch(/[A-Z]/);
     expect(password).toMatch(/[0-9]/);
-    expect(password).toMatch(/[!@#$%^&*]/);
+  });
+
+  it('NO incluye caracteres que rompen .env o DATABASE_URL', () => {
+    // '$' dispara la interpolacion de variables de Docker Compose en el .env
+    // (la contraseña se trunca/vacia y Postgres cae al default). '@ # % / : ?'
+    // rompen el parseo del connection string de postgres. Solo permitimos
+    // caracteres seguros en .env, en URLs y en shells.
+    for (let i = 0; i < 50; i++) {
+      const password = generatePassword(64);
+      expect(password).not.toMatch(/[^A-Za-z0-9]/);
+    }
+  });
+
+  it('sobrevive intacto dentro de un DATABASE_URL', () => {
+    for (let i = 0; i < 20; i++) {
+      const pw = generatePassword(24);
+      const url = new URL(`postgresql://openfactu:${pw}@db:5432/openfactudb`);
+      expect(url.password).toBe(pw);
+      expect(url.hostname).toBe('db');
+      expect(url.pathname).toBe('/openfactudb');
+    }
   });
 
   it('usa longitud por defecto de 32', () => {

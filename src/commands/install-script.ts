@@ -123,7 +123,9 @@ check_command() {
 }
 
 generate_password() {
-    openssl rand -base64 32 | tr -dc 'a-zA-Z0-9!@#$%^&*' | head -c 24
+    # Solo alfanumericos: '$' rompe la interpolacion del .env en Docker Compose
+    # y '@ # % /' rompen el DATABASE_URL. Ver generatePassword() en la CLI.
+    openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c 24
 }
 
 # ============================================================

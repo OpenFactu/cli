@@ -8,6 +8,14 @@ import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import { log } from '../utils/logger';
+import { applyEnvOverrides } from '../utils/env';
+import {
+  basicMonitoringServices,
+  fullMonitoringServices,
+  generateMonitoringCompose,
+  monitoringChoices,
+  writeMonitoringConfigs,
+} from '../utils/monitoring';
 import {
   generatePassword,
   generateSlug,
@@ -123,8 +131,7 @@ function writeInstallLog(targetDir: string) {
   } catch {}
 }
 
-function generateEnvConfig(targetDir: string): Record<string, string> {
-  const dbPassword = generatePassword(24);
+function generateEnvConfig(dbPassword: string): Record<string, string> {
   const postgresUser = 'openfactu';
   const postgresDb = 'openfactudb';
   const jwtSecret = generatePassword(48);
@@ -135,7 +142,7 @@ function generateEnvConfig(targetDir: string): Record<string, string> {
     POSTGRES_USER: postgresUser,
     POSTGRES_PASSWORD: dbPassword,
     POSTGRES_DB: postgresDb,
-    DATABASE_URL: `postgresql://${postgresUser}:${dbPassword}@db:5432/${postgresDb}`,
+    DATABASE_URL: `postgresql://${postgresUser}:${encodeURIComponent(dbPassword)}@db:5432/${postgresDb}`,
     SERVER_PORT: '3000',
     WEB_PORT: '8080',
     DB_PORT: '5432',
@@ -470,38 +477,47 @@ export function registerInstallCommand(program: Command) {
           logStep('Estructura del repositorio válida', 'success');
         }
 
-        // 7. Generar/configurar .env
-        if (opts.generateEnv || nonInteractive) {
-          const envSpinner = ora('Generando configuración segura...').start();
-          const envConfig = generateEnvConfig(targetDir);
-
+        // 7. Configurar .env — las credenciales (incluida la contraseña de BD) se
+        //    fijan AQUI, antes del primer arranque, para que el volumen de Postgres
+        //    se inicialice con ellas y no acabe usando la contraseña por defecto.
+        {
           const envFile = path.join(targetDir, '.env');
-          const existingEnv = fs.existsSync(envFile) ? fs.readFileSync(envFile, 'utf-8') : '';
+          const envExample = path.join(targetDir, '.env.example');
 
-          const lines: string[] = [];
-          for (const [key, value] of Object.entries(envConfig)) {
-            const existingRegex = new RegExp(`^${key}=.*$`, 'm');
-            if (existingRegex.test(existingEnv)) {
-              lines.push(existingEnv.replace(existingRegex, `${key}=${value}`));
-            } else {
-              lines.push(`${key}=${value}`);
-            }
+          // Decidir la contraseña de PostgreSQL.
+          let dbPassword: string;
+          if (opts.generateEnv || nonInteractive) {
+            dbPassword = generatePassword(24);
+          } else {
+            const suggested = generatePassword(24);
+            const { pw } = await inquirer.prompt([
+              {
+                type: 'input',
+                name: 'pw',
+                message: 'Contraseña de PostgreSQL (Enter = generar una segura):',
+                default: suggested,
+              },
+            ]);
+            dbPassword = typeof pw === 'string' && pw.trim() ? pw.trim() : suggested;
           }
 
-          fs.writeFileSync(envFile, lines.join('\n') + '\n');
-          envSpinner.succeed('.env generado con credenciales seguras');
+          const envSpinner = ora('Configurando .env con credenciales seguras...').start();
+          const envConfig = generateEnvConfig(dbPassword);
+
+          // Plantilla base: .env.example si existe (preserva comentarios y claves
+          // propias de la plataforma); si no, un .env generado desde cero.
+          const baseContent = fs.existsSync(envExample)
+            ? fs.readFileSync(envExample, 'utf-8')
+            : generateEnvFileContent(envConfig);
+
+          fs.writeFileSync(envFile, applyEnvOverrides(baseContent, envConfig));
+          envSpinner.succeed('.env configurado con credenciales seguras');
+          logStep('.env configurado con credenciales seguras', 'success');
           log.blank();
-          log.info(`${chalk.dim('Admin:')} admin@openfactu.local / ${chalk.yellow(envConfig.ADMIN_PASSWORD)}`);
+          log.info(`${chalk.dim('Admin:')} ${envConfig.ADMIN_EMAIL} / ${chalk.yellow(envConfig.ADMIN_PASSWORD)}`);
           log.info(`${chalk.dim('DB Password:')} ${chalk.yellow(envConfig.POSTGRES_PASSWORD)}`);
           log.dim('  Guarda estas credenciales en un lugar seguro');
           log.blank();
-        } else {
-          const envExample = path.join(targetDir, '.env.example');
-          const envFile = path.join(targetDir, '.env');
-          if (fs.existsSync(envExample) && !fs.existsSync(envFile)) {
-            fs.copyFileSync(envExample, envFile);
-            log.success('Archivo .env creado desde .env.example');
-          }
         }
 
         // 8. Determinar modo de instalación
@@ -686,34 +702,64 @@ export function registerInstallCommand(program: Command) {
           }
         }
 
-        // 9. Preguntar por monitoring/analytics
-        let includeMonitoring = opts.monitoring || false;
-        let includeAnalytics = opts.withAnalytics || false;
+        // 9. Monitoreo — selección granular de servicios
+        let includeMonitoring = false;
+        let monitoringServices: string[] = [];
 
-        if (!nonInteractive && (installMode === 'full' || installMode === 'docker')) {
-          if (!includeMonitoring) {
+        if (installMode === 'full' || installMode === 'docker') {
+          if (opts.withAnalytics) {
+            includeMonitoring = true;
+            monitoringServices = fullMonitoringServices();
+          } else if (opts.monitoring) {
+            includeMonitoring = true;
+            monitoringServices = basicMonitoringServices();
+          } else if (!nonInteractive) {
             const { monitoring } = await inquirer.prompt([
               {
                 type: 'confirm',
                 name: 'monitoring',
-                message: 'Incluir stack de monitoreo (Grafana, Prometheus, pgAdmin, Portainer)?',
+                message: 'Incluir stack de monitoreo (Grafana, Prometheus, pgAdmin, Portainer…)?',
                 default: false,
               },
             ]);
-            includeMonitoring = monitoring;
+            if (monitoring) {
+              const { services } = await inquirer.prompt([
+                {
+                  type: 'checkbox',
+                  name: 'services',
+                  message: 'Servicios de monitoreo a instalar:',
+                  choices: monitoringChoices(),
+                },
+              ]);
+              monitoringServices = services as string[];
+              includeMonitoring = monitoringServices.length > 0;
+            }
           }
+        }
 
-          if (includeMonitoring && !includeAnalytics) {
-            const { analytics } = await inquirer.prompt([
-              {
-                type: 'confirm',
-                name: 'analytics',
-                message: 'Incluir analítica avanzada (Loki para logs, cAdvisor para contenedores, Node Exporter)?',
-                default: false,
-              },
-            ]);
-            includeAnalytics = analytics;
+        // Generar docker-compose.monitoring.yml + configs con los servicios elegidos
+        if (includeMonitoring && monitoringServices.length > 0) {
+          const monSpinner = ora('Generando stack de monitoreo...').start();
+          const serviceSet = new Set<string>(monitoringServices);
+          fs.writeFileSync(
+            path.join(targetDir, 'docker-compose.monitoring.yml'),
+            generateMonitoringCompose(serviceSet),
+          );
+          writeMonitoringConfigs(targetDir, serviceSet);
+
+          const envFile = path.join(targetDir, '.env');
+          if (fs.existsSync(envFile)) {
+            fs.writeFileSync(
+              envFile,
+              applyEnvOverrides(fs.readFileSync(envFile, 'utf-8'), {
+                MONITORING_SERVICES: monitoringServices.join(','),
+              }),
+            );
           }
+          monSpinner.succeed(`Monitoreo: ${monitoringServices.join(', ')}`);
+          logStep(`Monitoreo configurado: ${monitoringServices.join(', ')}`, 'success');
+        } else {
+          includeMonitoring = false;
         }
 
         // Preguntar por servicio systemd (siempre, si es Linux)
@@ -1237,8 +1283,7 @@ export function registerInstallCommand(program: Command) {
         console.log(`  ${chalk.dim('Commit:')}     ${chalk.cyan(installedCommit)}`);
         console.log(`  ${chalk.dim('Directorio:')} ${chalk.white(targetDir)}`);
         console.log(`  ${chalk.dim('Modo:')}       ${chalk.white(installMode)}`);
-        if (includeMonitoring) console.log(`  ${chalk.dim('Monitoreo:')}  ${chalk.green('Incluido')}`);
-        if (includeAnalytics) console.log(`  ${chalk.dim('Analítica:')}  ${chalk.green('Incluida')}`);
+        if (includeMonitoring) console.log(`  ${chalk.dim('Monitoreo:')}  ${chalk.green(monitoringServices.join(', '))}`);
         log.blank();
 
         logStep('Instalación completada exitosamente', 'success');

@@ -11,7 +11,12 @@ export interface SystemCheck {
 }
 
 export function generatePassword(length = 32): string {
-  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*';
+  // Solo alfanumericos: los simbolos (! @ # $ % ^ & *) rompen el stack.
+  //  - '$' dispara la interpolacion de variables de Docker Compose al leer el
+  //    .env, vaciando la contraseña y haciendo que Postgres caiga al default.
+  //  - '@ # % / : ?' rompen el parseo del connection string en DATABASE_URL.
+  // Con 62 caracteres y longitud >= 24 la entropia sigue siendo de sobra (>140 bits).
+  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
   let result = '';
   const bytes = crypto.randomBytes(length);
   for (let i = 0; i < length; i++) {

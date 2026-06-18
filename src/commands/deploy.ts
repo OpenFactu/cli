@@ -8,6 +8,7 @@ import path from 'path';
 import os from 'os';
 import { log } from '../utils/logger';
 import { getProjectRoot, getMonitoringComposePath } from '../utils/paths';
+import { generatePassword } from '../utils/helpers';
 
 function getLocalIPs(): string[] {
   const interfaces = os.networkInterfaces();
@@ -224,31 +225,37 @@ export function registerDeployCommand(program: Command) {
           dbPort = answers.dbPort;
         }
 
-        // Password de BD
-        const { dbPassword } = await inquirer.prompt([
-          {
-            type: 'input',
-            name: 'dbPassword',
-            message: 'Password de PostgreSQL:',
-            default: 'openfactu_pass',
-          },
-        ]);
+        // Password de BD: se reutiliza la fijada en `install` (está en el .env).
+        // No se vuelve a preguntar: cambiarla aquí no surte efecto sobre un
+        // volumen de Postgres ya inicializado, así que evitamos esa trampa.
+        const dbPassword = readEnv(envPath).POSTGRES_PASSWORD || generatePassword(24);
 
         // 3. Construir configuración
-        const protocol = useSSL ? 'https' : 'http';
-        const webUrl = webPort === '80' || webPort === '443'
-          ? `${protocol}://${host}`
-          : `${protocol}://${host}:${webPort}`;
-        const apiUrl = serverPort === '80' || serverPort === '443'
-          ? `${protocol}://${host}`
-          : `${protocol}://${host}:${serverPort}`;
+        // Con SSL el ÚNICO punto de entrada es Caddy en httpsPort: enruta
+        // "/" → web:80 y "/api/*" → server:3000. Por eso las URLs de cara al
+        // usuario (web, API, VITE_API_URL, CORS_ORIGIN) deben apuntar a Caddy,
+        // no a los puertos HTTP planos web/api (8080/3000).
+        let webUrl: string;
+        let apiUrl: string;
+        if (useSSL) {
+          const base = httpsPort === '443' ? `https://${host}` : `https://${host}:${httpsPort}`;
+          webUrl = base;
+          apiUrl = base;
+        } else {
+          webUrl = webPort === '80' || webPort === '443'
+            ? `http://${host}`
+            : `http://${host}:${webPort}`;
+          apiUrl = serverPort === '80' || serverPort === '443'
+            ? `http://${host}`
+            : `http://${host}:${serverPort}`;
+        }
 
         log.blank();
         log.title('  Resumen de configuración');
         log.info(`Web:         ${chalk.cyan(webUrl)}`);
         log.info(`API:         ${chalk.cyan(apiUrl)}`);
         log.info(`BD Puerto:   ${chalk.cyan(dbPort)} ${chalk.dim('(host)')}`);
-        log.info(`BD Password: ${chalk.dim(dbPassword === 'openfactu_pass' ? '(default)' : '****')}`);
+        log.info(`BD Password: ${chalk.dim('(reutilizada de install)')}`);
         log.info(`SSL:         ${useSSL ? chalk.green('Si') : chalk.dim('No')}`);
         log.blank();
 
@@ -270,7 +277,7 @@ export function registerDeployCommand(program: Command) {
         env.POSTGRES_USER = env.POSTGRES_USER || 'openfactu';
         env.POSTGRES_PASSWORD = dbPassword;
         env.POSTGRES_DB = env.POSTGRES_DB || 'openfactudb';
-        env.DATABASE_URL = `postgresql://${env.POSTGRES_USER}:${dbPassword}@db:5432/${env.POSTGRES_DB}`;
+        env.DATABASE_URL = `postgresql://${env.POSTGRES_USER}:${encodeURIComponent(dbPassword)}@db:5432/${env.POSTGRES_DB}`;
         env.VITE_API_URL = apiUrl;
         env.HOST = host;
         env.CORS_ORIGIN = webUrl;
@@ -332,13 +339,10 @@ export function registerDeployCommand(program: Command) {
     restart: unless-stopped
     networks:
       - openfactu_net
-
-networks:
-  openfactu_net:
-    driver: bridge
 `;
 
-        // Si SSL, añadir Caddy reverse proxy con Let's Encrypt
+        // Si SSL, añadir Caddy reverse proxy con Let's Encrypt (servicio dentro de
+        // services:). El bloque top-level networks: se añade SIEMPRE al final.
         if (useSSL) {
           composeContent += `
   caddy:
@@ -389,6 +393,12 @@ http://${host} {
 }
 ${httpRedirect}`;
           fs.writeFileSync(caddyfilePath, caddyfileContent);
+          composeContent += `
+networks:
+  openfactu_net:
+    driver: bridge
+`;
+          fs.writeFileSync(prodComposePath, composeContent);
           prodSpinner.succeed('docker-compose.prod.yml y Caddyfile generados');
           log.blank();
           if (isLAN) {
@@ -405,6 +415,12 @@ ${httpRedirect}`;
             log.dim('  Asegúrate de abrir estos puertos en el firewall');
           }
         } else {
+          composeContent += `
+networks:
+  openfactu_net:
+    driver: bridge
+`;
+          fs.writeFileSync(prodComposePath, composeContent);
           prodSpinner.succeed('docker-compose.prod.yml generado');
         }
 
@@ -647,7 +663,7 @@ ${httpRedirect}`;
           : '';
 
         if (!composeContent.includes('caddy:')) {
-          composeContent += `
+          const caddyBlock = `
   caddy:
     image: caddy:2-alpine
     container_name: openfactu-caddy
@@ -664,11 +680,22 @@ ${httpRedirect}`;
     restart: unless-stopped
     networks:
       - openfactu_net
-
+`;
+          const volumesBlock = `
 volumes:
   caddy_data:
   caddy_config:
 `;
+          // Insertar caddy DENTRO de services (antes del bloque top-level
+          // "networks:"), no al final, para que no quede anidado bajo networks:.
+          if (/\nnetworks:/.test(composeContent)) {
+            composeContent = composeContent.replace(
+              /\nnetworks:/,
+              () => `${caddyBlock}${volumesBlock}\nnetworks:`,
+            );
+          } else {
+            composeContent += caddyBlock + volumesBlock;
+          }
           fs.writeFileSync(prodComposePath, composeContent);
         }
 
@@ -751,17 +778,16 @@ volumes:
 
         console.log(output);
 
-        // Mostrar URLs
+        // Mostrar URLs realmente configuradas en .env (correctas con o sin SSL/Caddy)
         const envPath = path.join(root, '.env');
         const env = readEnv(envPath);
         const host = env.HOST || 'localhost';
-        const webPort = env.WEB_PORT || '8080';
-        const serverPort = env.SERVER_PORT || '3000';
-        const protocol = env.VITE_API_URL?.startsWith('https') ? 'https' : 'http';
+        const webUrl = env.CORS_ORIGIN || `http://${host}:${env.WEB_PORT || '8080'}`;
+        const apiUrl = env.VITE_API_URL || `http://${host}:${env.SERVER_PORT || '3000'}`;
 
         log.blank();
-        log.info(`Web: ${chalk.cyan(`${protocol}://${host}:${webPort}`)}`);
-        log.info(`API: ${chalk.cyan(`${protocol}://${host}:${serverPort}`)}`);
+        log.info(`Web: ${chalk.cyan(webUrl)}`);
+        log.info(`API: ${chalk.cyan(apiUrl)}`);
       } catch (err: any) {
         log.error('Docker no disponible o servicios no levantados');
         log.dim('  ' + err.message);

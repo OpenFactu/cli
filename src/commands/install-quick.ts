@@ -145,7 +145,7 @@ export function registerInstallQuickCommand(program: Command) {
           const envContent = `POSTGRES_USER=openfactu
 POSTGRES_PASSWORD=${dbPassword}
 POSTGRES_DB=openfactudb
-DATABASE_URL=postgresql://openfactu:${dbPassword}@db:5432/openfactudb
+DATABASE_URL=postgresql://openfactu:${encodeURIComponent(dbPassword)}@db:5432/openfactudb
 SERVER_PORT=3000
 WEB_PORT=8080
 DB_PORT=5432

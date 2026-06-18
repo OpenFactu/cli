@@ -7,7 +7,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { log } from '../utils/logger';
-import { getProjectRoot } from '../utils/paths';
+import { getProjectRoot, getMonitoringComposePath } from '../utils/paths';
 
 function getLocalIPs(): string[] {
   const interfaces = os.networkInterfaces();
@@ -21,6 +21,26 @@ function getLocalIPs(): string[] {
     }
   }
   return ips;
+}
+
+function checkPortInUse(port: number): { inUse: boolean; process?: string } {
+  try {
+    const output = execSync(`lsof -i :${port} -sTCP:LISTEN -t 2>/dev/null | grep -v 'docker-pr' || true`, {
+      stdio: 'pipe',
+    }).toString().trim();
+
+    if (output) {
+      const pid = output.split('\n')[0].trim();
+      let processName = 'desconocido';
+      try {
+        processName = execSync(`ps -p ${pid} -o comm= 2>/dev/null || echo 'desconocido'`, { stdio: 'pipe' }).toString().trim();
+      } catch {}
+      return { inUse: true, process: `${processName} (PID: ${pid})` };
+    }
+    return { inUse: false };
+  } catch {
+    return { inUse: false };
+  }
 }
 
 function readEnv(envPath: string): Record<string, string> {
@@ -50,7 +70,8 @@ export function registerDeployCommand(program: Command) {
   program
     .command('deploy')
     .description('Configura OpenFactu para producción (acceso externo)')
-    .action(async () => {
+    .option('--with-monitoring', 'Incluir stack de monitoreo (Grafana, Prometheus, etc.)')
+    .action(async (opts) => {
       console.log();
       console.log(chalk.bold.white('  OpenFactu — Configurar Despliegue'));
       console.log(chalk.dim('  ────────────────────────────────────'));
@@ -106,6 +127,16 @@ export function registerDeployCommand(program: Command) {
           } else {
             host = selectedIP;
           }
+
+          const { ssl } = await inquirer.prompt([
+            {
+              type: 'confirm',
+              name: 'ssl',
+              message: '¿Usar HTTPS? (certificado auto-firmado para red local)',
+              default: false,
+            },
+          ]);
+          useSSL = ssl;
         } else if (mode === 'public') {
           const { domain } = await inquirer.prompt([
             {
@@ -125,6 +156,51 @@ export function registerDeployCommand(program: Command) {
             },
           ]);
           useSSL = ssl;
+        }
+
+        // Verificar conflictos de puertos si se usa SSL
+        let httpPort = '80';
+        let httpsPort = '443';
+
+        if (useSSL) {
+          const port80 = checkPortInUse(80);
+          const port443 = checkPortInUse(443);
+
+          if (port80.inUse || port443.inUse) {
+            log.blank();
+            log.warn('Puertos en conflicto detectados:');
+            if (port80.inUse) log.warn(`  Puerto 80: ocupado por ${port80.process}`);
+            if (port443.inUse) log.warn(`  Puerto 443: ocupado por ${port443.process}`);
+            log.blank();
+
+            const { portAction } = await inquirer.prompt([
+              {
+                type: 'list',
+                name: 'portAction',
+                message: '¿Cómo resolver el conflicto?',
+                choices: [
+                  { name: 'Usar puertos alternativos (8080/8443)', value: 'alternate' },
+                  { name: 'Especificar puertos personalizados', value: 'custom' },
+                  { name: 'Continuar con 80/443 (puede fallar)', value: 'continue' },
+                  { name: 'Desactivar HTTPS', value: 'nossl' },
+                ],
+              },
+            ]);
+
+            if (portAction === 'nossl') {
+              useSSL = false;
+            } else if (portAction === 'alternate') {
+              httpPort = '8080';
+              httpsPort = '8443';
+            } else if (portAction === 'custom') {
+              const { customHttp, customHttps } = await inquirer.prompt([
+                { type: 'input', name: 'customHttp', message: 'Puerto HTTP alternativo:', default: '8080' },
+                { type: 'input', name: 'customHttps', message: 'Puerto HTTPS alternativo:', default: '8443' },
+              ]);
+              httpPort = customHttp;
+              httpsPort = customHttps;
+            }
+          }
         }
 
         // Puertos
@@ -262,43 +338,149 @@ networks:
     driver: bridge
 `;
 
-        // Si SSL, añadir nginx reverse proxy
+        // Si SSL, añadir Caddy reverse proxy con Let's Encrypt
         if (useSSL) {
           composeContent += `
-  # Para SSL, configura un reverse proxy (nginx, traefik, caddy) delante.
-  # Ejemplo con Caddy (descomentar):
-  #
-  # caddy:
-  #   image: caddy:2-alpine
-  #   ports:
-  #     - "0.0.0.0:80:80"
-  #     - "0.0.0.0:443:443"
-  #   volumes:
-  #     - ./Caddyfile:/etc/caddy/Caddyfile
-  #     - caddy_data:/data
-  #   depends_on:
-  #     - web
-  #     - server
-  #   networks:
-  #     - openfactu_net
-  #
-  # volumes:
-  #   caddy_data:
-  #
-  # Caddyfile:
-  #   ${host} {
-  #     handle /api/* {
-  #       reverse_proxy server:3000
-  #     }
-  #     handle {
-  #       reverse_proxy web:80
-  #     }
-  #   }
+  caddy:
+    image: caddy:2-alpine
+    container_name: openfactu-caddy
+    ports:
+      - "0.0.0.0:${httpPort}:80"
+      - "0.0.0.0:${httpsPort}:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+      - server
+    restart: unless-stopped
+    networks:
+      - openfactu_net
+
+volumes:
+  caddy_data:
+  caddy_config:
 `;
+          // Generar Caddyfile
+          const caddyfilePath = path.join(root, 'Caddyfile');
+          const isLAN = mode === 'lan';
+          const tlsDirective = isLAN ? 'tls internal' : '';
+          const httpRedirect = isLAN ? '' : `
+http://${host} {
+    redir https://{host}{uri} permanent
+}
+`;
+          const caddyfileContent = `${host} {
+    ${tlsDirective}
+    encode gzip
+
+    handle /api/* {
+        reverse_proxy server:3000
+    }
+
+    handle {
+        reverse_proxy web:80
+    }
+
+    log {
+        output file /var/log/caddy/access.log
+    }
+}
+${httpRedirect}`;
+          fs.writeFileSync(caddyfilePath, caddyfileContent);
+          prodSpinner.succeed('docker-compose.prod.yml y Caddyfile generados');
+          log.blank();
+          if (isLAN) {
+            log.info('Caddy generará certificado auto-firmado para la red local');
+            log.dim('  Los navegadores mostrarán advertencia de seguridad (es normal)');
+          } else {
+            log.info('Caddy obtendrá certificados Let\'s Encrypt automáticamente');
+            log.dim('  El DNS debe apuntar a este servidor');
+            log.dim('  El primer request tardará unos segundos mientras se obtiene el certificado');
+          }
+          if (httpPort !== '80' || httpsPort !== '443') {
+            log.blank();
+            log.info(`Puertos alternativos: HTTP=${httpPort}, HTTPS=${httpsPort}`);
+            log.dim('  Asegúrate de abrir estos puertos en el firewall');
+          }
+        } else {
+          prodSpinner.succeed('docker-compose.prod.yml generado');
         }
 
-        fs.writeFileSync(prodComposePath, composeContent);
-        prodSpinner.succeed('docker-compose.prod.yml generado');
+        // Generar docker-compose.prod.monitoring.yml si se pidió monitoreo
+        if (opts.withMonitoring) {
+          const monSpinner = ora('Generando docker-compose.prod.monitoring.yml...').start();
+          const monitoringComposePath = path.join(root, 'docker-compose.prod.monitoring.yml');
+          const monitoringCompose = `services:
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    environment:
+      PGADMIN_DEFAULT_EMAIL: \${PGADMIN_EMAIL:-admin@openfactu.local}
+      PGADMIN_DEFAULT_PASSWORD: \${PGADMIN_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "0.0.0.0:\${PGADMIN_PORT:-5050}:80"
+    volumes:
+      - ./storage/pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      - db
+    restart: unless-stopped
+    networks:
+      - openfactu_net
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      - GF_SECURITY_ADMIN_USER=\${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=\${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "0.0.0.0:\${GRAFANA_PORT:-3001}:3000"
+    volumes:
+      - ./storage/grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - openfactu_net
+
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.enable-lifecycle'
+    ports:
+      - "0.0.0.0:\${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./storage/prometheus_data:/prometheus
+    restart: unless-stopped
+    networks:
+      - openfactu_net
+
+  portainer:
+    image: portainer/portainer-ce:latest
+    command: -H unix:///var/run/docker.sock
+    ports:
+      - "0.0.0.0:\${PORTAINER_PORT:-9000}:9000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./storage/portainer_data:/data
+    restart: unless-stopped
+    networks:
+      - openfactu_net
+
+networks:
+  openfactu_net:
+    name: openfactu_net
+    driver: bridge
+`;
+          fs.writeFileSync(monitoringComposePath, monitoringCompose);
+          monSpinner.succeed('docker-compose.prod.monitoring.yml generado');
+        }
 
         // 6. Preguntar si levantar
         log.blank();
@@ -339,7 +521,9 @@ networks:
         } else if (mode === 'public') {
           log.info('Asegúrate de que los puertos estén abiertos en el firewall');
           if (useSSL) {
-            log.info('Configura el reverse proxy (Caddy/Nginx) para SSL');
+            log.info('Caddy obtendrá certificado Let\'s Encrypt automáticamente');
+            log.dim('  El DNS debe apuntar a este servidor para que funcione');
+            log.dim('  Puertos requeridos: 80 (HTTP) y 443 (HTTPS)');
           }
         }
 
@@ -355,20 +539,213 @@ networks:
       }
     });
 
+  // ── openfactu deploy:ssl ──
+  program
+    .command('deploy:ssl')
+    .description('Activa HTTPS en un despliegue existente con Caddy')
+    .option('--domain <domain>', 'Dominio para el certificado')
+    .option('--lan', 'Usar certificado auto-firmado para red local')
+    .option('--port <port>', 'Puerto HTTPS (default: 443)', '443')
+    .action(async (opts) => {
+      console.log();
+      console.log(chalk.bold.white('  OpenFactu — Activar HTTPS'));
+      console.log(chalk.dim('  ────────────────────────────────────'));
+      console.log();
+
+      try {
+        const root = getProjectRoot();
+        const envPath = path.join(root, '.env');
+        const env = readEnv(envPath);
+        const host = opts.domain || env.HOST || 'localhost';
+        const isLAN = opts.lan || false;
+
+        if (!isLAN && !opts.domain) {
+          const { domain } = await inquirer.prompt([
+            {
+              type: 'input',
+              name: 'domain',
+              message: 'Dominio para el certificado Let\'s Encrypt:',
+              default: host,
+            },
+          ]);
+          opts.domain = domain;
+        }
+
+        const finalHost = opts.domain || host;
+        let httpsPort = opts.port || '443';
+        let httpPort = '80';
+
+        // Verificar conflictos de puertos
+        const port80 = checkPortInUse(80);
+        const port443 = checkPortInUse(443);
+
+        if (port80.inUse || port443.inUse) {
+          log.blank();
+          log.warn('Puertos en conflicto detectados:');
+          if (port80.inUse) log.warn(`  Puerto 80: ocupado por ${port80.process}`);
+          if (port443.inUse) log.warn(`  Puerto 443: ocupado por ${port443.process}`);
+          log.blank();
+
+          const { portAction } = await inquirer.prompt([
+            {
+              type: 'list',
+              name: 'portAction',
+              message: '¿Cómo resolver el conflicto?',
+              choices: [
+                { name: 'Usar puertos alternativos (8080/8443)', value: 'alternate' },
+                { name: 'Especificar puertos personalizados', value: 'custom' },
+                { name: 'Continuar con 80/443 (puede fallar)', value: 'continue' },
+              ],
+            },
+          ]);
+
+          if (portAction === 'alternate') {
+            httpPort = '8080';
+            httpsPort = '8443';
+          } else if (portAction === 'custom') {
+            const { customHttp, customHttps } = await inquirer.prompt([
+              { type: 'input', name: 'customHttp', message: 'Puerto HTTP alternativo:', default: '8080' },
+              { type: 'input', name: 'customHttps', message: 'Puerto HTTPS alternativo:', default: '8443' },
+            ]);
+            httpPort = customHttp;
+            httpsPort = customHttps;
+          }
+        }
+
+        // Generar Caddyfile
+        const tlsDirective = isLAN ? 'tls internal' : '';
+        const httpRedirect = isLAN ? '' : `
+http://${finalHost} {
+    redir https://${finalHost}{uri} permanent
+}
+`;
+        const caddyfileContent = `${finalHost} {
+    ${tlsDirective}
+    encode gzip
+
+    handle /api/* {
+        reverse_proxy server:3000
+    }
+
+    handle {
+        reverse_proxy web:80
+    }
+
+    log {
+        output file /var/log/caddy/access.log
+    }
+}
+${httpRedirect}`;
+
+        const caddyfilePath = path.join(root, 'Caddyfile');
+        fs.writeFileSync(caddyfilePath, caddyfileContent);
+
+        // Actualizar docker-compose.prod.yml para añadir Caddy
+        const prodComposePath = path.join(root, 'docker-compose.prod.yml');
+        let composeContent = fs.existsSync(prodComposePath)
+          ? fs.readFileSync(prodComposePath, 'utf-8')
+          : '';
+
+        if (!composeContent.includes('caddy:')) {
+          composeContent += `
+  caddy:
+    image: caddy:2-alpine
+    container_name: openfactu-caddy
+    ports:
+      - "0.0.0.0:${httpPort}:80"
+      - "0.0.0.0:${httpsPort}:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+      - server
+    restart: unless-stopped
+    networks:
+      - openfactu_net
+
+volumes:
+  caddy_data:
+  caddy_config:
+`;
+          fs.writeFileSync(prodComposePath, composeContent);
+        }
+
+        // Actualizar .env
+        const protocol = 'https';
+        const webUrl = httpsPort === '443'
+          ? `${protocol}://${finalHost}`
+          : `${protocol}://${finalHost}:${httpsPort}`;
+        env.VITE_API_URL = webUrl;
+        env.CORS_ORIGIN = webUrl;
+        env.HOST = finalHost;
+        writeEnv(envPath, env);
+
+        log.blank();
+        log.success('HTTPS configurado');
+        log.blank();
+        log.info(`URL: ${chalk.cyan(webUrl)}`);
+        if (httpPort !== '80' || httpsPort !== '443') {
+          log.info(`Puertos: HTTP=${httpPort}, HTTPS=${httpsPort}`);
+        }
+        if (isLAN) {
+          log.dim('  Certificado auto-firmado (los navegadores mostrarán advertencia)');
+        } else {
+          log.dim('  Caddy obtendrá certificado Let\'s Encrypt en el primer request');
+          log.dim('  El DNS debe apuntar a este servidor');
+        }
+        log.blank();
+
+        const { restart } = await inquirer.prompt([
+          {
+            type: 'confirm',
+            name: 'restart',
+            message: '¿Reiniciar servicios para aplicar HTTPS?',
+            default: true,
+          },
+        ]);
+
+        if (restart) {
+          const spinner = ora('Reiniciando servicios...').start();
+          try {
+            execSync('docker compose -f docker-compose.prod.yml up -d', {
+              cwd: root,
+              stdio: 'pipe',
+              timeout: 120000,
+            });
+            spinner.succeed('Servicios reiniciados');
+          } catch (err: any) {
+            spinner.fail('Error: ' + err.message);
+          }
+        }
+      } catch (err: any) {
+        log.error(err.message);
+        process.exitCode = 1;
+      }
+    });
+
   // ── openfactu deploy:status ──
   program
     .command('deploy:status')
     .description('Muestra el estado de los servicios Docker')
-    .action(async () => {
+    .option('--with-monitoring', 'Incluir servicios de monitoreo')
+    .action(async (opts) => {
       try {
         const root = getProjectRoot();
         const prodCompose = path.join(root, 'docker-compose.prod.yml');
         const composeFile = fs.existsSync(prodCompose) ? 'docker-compose.prod.yml' : 'docker-compose.yml';
+        const monitoringCompose = path.join(root, 'docker-compose.prod.monitoring.yml');
+        const useMonitoring = opts.withMonitoring && fs.existsSync(monitoringCompose);
 
         log.info(`Usando: ${chalk.dim(composeFile)}`);
+        if (useMonitoring) log.info(`Monitoreo: ${chalk.dim('docker-compose.prod.monitoring.yml')}`);
         log.blank();
 
-        const output = execSync(`docker compose -f ${composeFile} ps`, {
+        const files = useMonitoring
+          ? `-f ${composeFile} -f docker-compose.prod.monitoring.yml`
+          : `-f ${composeFile}`;
+        const output = execSync(`docker compose ${files} ps`, {
           cwd: root,
         }).toString();
 
@@ -397,21 +774,29 @@ networks:
     .description('Reconstruye y reinicia los contenedores Docker')
     .option('--service <name>', 'Reconstruir solo un servicio (web, server, db)')
     .option('--no-cache', 'Construir sin cache de Docker')
+    .option('--with-monitoring', 'Incluir servicios de monitoreo')
     .action(async (opts) => {
       try {
         const root = getProjectRoot();
         const prodCompose = path.join(root, 'docker-compose.prod.yml');
         const composeFile = fs.existsSync(prodCompose) ? 'docker-compose.prod.yml' : 'docker-compose.yml';
+        const monitoringCompose = path.join(root, 'docker-compose.prod.monitoring.yml');
+        const useMonitoring = opts.withMonitoring && fs.existsSync(monitoringCompose);
 
         const service = opts.service || '';
         const noCache = opts.cache === false ? ' --no-cache' : '';
 
         log.info(`Usando: ${chalk.dim(composeFile)}`);
+        if (useMonitoring) log.info(`Monitoreo: ${chalk.dim('docker-compose.prod.monitoring.yml')}`);
         log.blank();
+
+        const files = useMonitoring
+          ? `-f ${composeFile} -f docker-compose.prod.monitoring.yml`
+          : `-f ${composeFile}`;
 
         const buildSpinner = ora(`Construyendo${service ? ' ' + service : ' todos los servicios'}...`).start();
         try {
-          execSync(`docker compose -f ${composeFile} build${noCache} ${service}`, {
+          execSync(`docker compose ${files} build${noCache} ${service}`, {
             cwd: root,
             stdio: 'pipe',
             timeout: 600000,
@@ -433,7 +818,7 @@ networks:
 
         const upSpinner = ora('Reiniciando servicios...').start();
         try {
-          execSync(`docker compose -f ${composeFile} up -d ${service}`, {
+          execSync(`docker compose ${files} up -d ${service}`, {
             cwd: root,
             stdio: 'pipe',
             timeout: 60000,
@@ -467,16 +852,23 @@ networks:
     .description('Muestra los logs de los servicios Docker')
     .option('--service <name>', 'Logs de un servicio especifico (web, server, db)')
     .option('-n, --lines <number>', 'Numero de lineas', '50')
+    .option('--with-monitoring', 'Incluir servicios de monitoreo')
     .action(async (opts) => {
       try {
         const root = getProjectRoot();
         const prodCompose = path.join(root, 'docker-compose.prod.yml');
         const composeFile = fs.existsSync(prodCompose) ? 'docker-compose.prod.yml' : 'docker-compose.yml';
+        const monitoringCompose = path.join(root, 'docker-compose.prod.monitoring.yml');
+        const useMonitoring = opts.withMonitoring && fs.existsSync(monitoringCompose);
 
         const service = opts.service || '';
         const lines = opts.lines || '50';
 
-        execSync(`docker compose -f ${composeFile} logs --tail ${lines} ${service}`, {
+        const files = useMonitoring
+          ? `-f ${composeFile} -f docker-compose.prod.monitoring.yml`
+          : `-f ${composeFile}`;
+
+        execSync(`docker compose ${files} logs --tail ${lines} ${service}`, {
           cwd: root,
           stdio: 'inherit',
         });
@@ -489,14 +881,21 @@ networks:
   program
     .command('stop')
     .description('Para todos los servicios Docker')
-    .action(async () => {
+    .option('--with-monitoring', 'Incluir servicios de monitoreo')
+    .action(async (opts) => {
       try {
         const root = getProjectRoot();
         const prodCompose = path.join(root, 'docker-compose.prod.yml');
         const composeFile = fs.existsSync(prodCompose) ? 'docker-compose.prod.yml' : 'docker-compose.yml';
+        const monitoringCompose = path.join(root, 'docker-compose.prod.monitoring.yml');
+        const useMonitoring = opts.withMonitoring && fs.existsSync(monitoringCompose);
+
+        const files = useMonitoring
+          ? `-f ${composeFile} -f docker-compose.prod.monitoring.yml`
+          : `-f ${composeFile}`;
 
         const spinner = ora('Parando servicios...').start();
-        execSync(`docker compose -f ${composeFile} down`, { cwd: root, stdio: 'pipe' });
+        execSync(`docker compose ${files} down`, { cwd: root, stdio: 'pipe' });
         spinner.succeed('Servicios parados');
       } catch (err: any) {
         log.error(err.message);
@@ -508,15 +907,22 @@ networks:
     .command('restart')
     .description('Reinicia los servicios Docker (sin rebuild)')
     .option('--service <name>', 'Reiniciar solo un servicio')
+    .option('--with-monitoring', 'Incluir servicios de monitoreo')
     .action(async (opts) => {
       try {
         const root = getProjectRoot();
         const prodCompose = path.join(root, 'docker-compose.prod.yml');
         const composeFile = fs.existsSync(prodCompose) ? 'docker-compose.prod.yml' : 'docker-compose.yml';
+        const monitoringCompose = path.join(root, 'docker-compose.prod.monitoring.yml');
+        const useMonitoring = opts.withMonitoring && fs.existsSync(monitoringCompose);
+
+        const files = useMonitoring
+          ? `-f ${composeFile} -f docker-compose.prod.monitoring.yml`
+          : `-f ${composeFile}`;
 
         const service = opts.service || '';
         const spinner = ora('Reiniciando...').start();
-        execSync(`docker compose -f ${composeFile} restart ${service}`, { cwd: root, stdio: 'pipe' });
+        execSync(`docker compose ${files} restart ${service}`, { cwd: root, stdio: 'pipe' });
         spinner.succeed('Servicios reiniciados');
       } catch (err: any) {
         log.error(err.message);

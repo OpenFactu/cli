@@ -25,7 +25,7 @@ function getLocalIPs(): string[] {
 
 function checkPortInUse(port: number): { inUse: boolean; process?: string } {
   try {
-    const output = execSync(`lsof -i :${port} -sTCP:LISTEN -t 2>/dev/null || ss -tlnp 'sport = :${port}' 2>/dev/null | grep -oP 'pid=\\K\\d+' || true`, {
+    const output = execSync(`lsof -i :${port} -sTCP:LISTEN -t 2>/dev/null | grep -v 'docker-pr' || true`, {
       stdio: 'pipe',
     }).toString().trim();
 

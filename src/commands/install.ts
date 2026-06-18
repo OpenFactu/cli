@@ -552,6 +552,140 @@ export function registerInstallCommand(program: Command) {
           }
         }
 
+        // Verificar conflictos de puertos ANTES de hacer más preguntas
+        if (installMode === 'full' || installMode === 'docker' || installMode === 'minimal') {
+          const commonPorts = [
+            { port: 5432, name: 'PostgreSQL', container: 'db' },
+            { port: 8080, name: 'Web', container: 'web' },
+            { port: 3000, name: 'API Server', container: 'server' },
+          ];
+
+          const conflicts = commonPorts.filter(p => {
+            try {
+              // Excluir docker-pr (proxies de Docker) que pueden quedar colgados
+              const output = execSync(`lsof -i :${p.port} -sTCP:LISTEN 2>/dev/null | grep -v 'docker-pr' | grep -v 'COMMAND' || true`, { stdio: 'pipe' }).toString().trim();
+              return output.length > 0;
+            } catch {
+              return false;
+            }
+          });
+
+          if (conflicts.length > 0 && !nonInteractive) {
+            log.blank();
+            log.warn('Puertos en conflicto detectados:');
+            for (const c of conflicts) {
+              let processInfo = '';
+              try {
+                const pid = execSync(`lsof -i :${c.port} -sTCP:LISTEN -t 2>/dev/null | grep -v 'docker-pr' | head -1`, { stdio: 'pipe' }).toString().trim();
+                if (pid) {
+                  const procName = execSync(`ps -p ${pid} -o comm= 2>/dev/null || echo 'desconocido'`, { stdio: 'pipe' }).toString().trim();
+                  processInfo = ` (${procName})`;
+                }
+              } catch {}
+              log.warn(`  Puerto ${c.port} (${c.name}): ocupado${processInfo}`);
+            }
+            log.blank();
+
+            const { portAction } = await inquirer.prompt([
+              {
+                type: 'list',
+                name: 'portAction',
+                message: '¿Cómo resolver el conflicto?',
+                choices: [
+                  { name: 'Detener el proceso que ocupa el puerto', value: 'stop' },
+                  { name: 'Usar puertos alternativos (5433, 8081, 3001)', value: 'alternate' },
+                  { name: 'Continuar igual (puede fallar)', value: 'continue' },
+                  { name: 'Cancelar instalación', value: 'cancel' },
+                ],
+              },
+            ]);
+
+            if (portAction === 'cancel') {
+              log.info('Instalación cancelada');
+              writeInstallLog(targetDir);
+              return;
+            }
+
+            if (portAction === 'stop') {
+              for (const c of conflicts) {
+                const stopSpinner = ora(`Deteniendo proceso en puerto ${c.port}...`).start();
+                try {
+                  const pid = execSync(`lsof -i :${c.port} -sTCP:LISTEN -t 2>/dev/null | head -1`, { stdio: 'pipe' }).toString().trim();
+                  if (pid) {
+                    execSync(`kill -9 ${pid} 2>/dev/null || true`, { stdio: 'pipe' });
+                    stopSpinner.succeed(`Proceso en puerto ${c.port} detenido`);
+                    logStep(`Puerto ${c.port} liberado`, 'success');
+                  } else {
+                    stopSpinner.warn(`No se encontró proceso en puerto ${c.port}`);
+                  }
+                } catch {
+                  stopSpinner.fail(`No se pudo detener el proceso en puerto ${c.port}`);
+                  log.dim(`  Intenta manualmente: sudo lsof -i :${c.port} -t | xargs kill -9`);
+                }
+              }
+              log.blank();
+            }
+
+            if (portAction === 'alternate') {
+              const portMap: Record<number, number> = { 5432: 5433, 8080: 8081, 3000: 3001 };
+
+              // Actualizar .env
+              const envPath = path.join(targetDir, '.env');
+              if (fs.existsSync(envPath)) {
+                let envContent = fs.readFileSync(envPath, 'utf-8');
+                for (const [oldPort, newPort] of Object.entries(portMap)) {
+                  const oldPortNum = parseInt(oldPort);
+                  if (conflicts.some(c => c.port === oldPortNum)) {
+                    envContent = envContent.replace(new RegExp(`:${oldPortNum}\\b`, 'g'), `:${newPort}`);
+                    envContent = envContent.replace(new RegExp(`PORT=${oldPortNum}`, 'g'), `PORT=${newPort}`);
+                    log.info(`Puerto ${oldPort} → ${newPort}`);
+                  }
+                }
+                fs.writeFileSync(envPath, envContent);
+                logStep('Puertos alternativos configurados en .env', 'success');
+              }
+
+              // Actualizar docker-compose files
+              const composeFiles = [
+                'docker-compose.yml',
+                'docker-compose.prod.yml',
+              ];
+
+              for (const composeFile of composeFiles) {
+                const composePath = path.join(targetDir, composeFile);
+                if (fs.existsSync(composePath)) {
+                  let composeContent = fs.readFileSync(composePath, 'utf-8');
+                  for (const [oldPort, newPort] of Object.entries(portMap)) {
+                    const oldPortNum = parseInt(oldPort);
+                    if (conflicts.some(c => c.port === oldPortNum)) {
+                      composeContent = composeContent.replace(
+                        new RegExp(`"([^"]*):${oldPortNum}"`, 'g'),
+                        `$1:${newPort}"`
+                      );
+                      composeContent = composeContent.replace(
+                        new RegExp(`- "${oldPortNum}:${oldPortNum}"`, 'g'),
+                        `- "${newPort}:${oldPortNum}"`
+                      );
+                      composeContent = composeContent.replace(
+                        new RegExp(`- "0\\.0\\.0\\.0:${oldPortNum}:`, 'g'),
+                        `- "0.0.0.0:${newPort}:`
+                      );
+                      composeContent = composeContent.replace(
+                        new RegExp(`- "127\\.0\\.0\\.1:${oldPortNum}:`, 'g'),
+                        `- "127.0.0.1:${newPort}:`
+                      );
+                    }
+                  }
+                  fs.writeFileSync(composePath, composeContent);
+                  logStep(`Puertos actualizados en ${composeFile}`, 'success');
+                }
+              }
+
+              log.blank();
+            }
+          }
+        }
+
         // 9. Preguntar por monitoring/analytics
         let includeMonitoring = opts.monitoring || false;
         let includeAnalytics = opts.withAnalytics || false;
@@ -609,8 +743,8 @@ export function registerInstallCommand(program: Command) {
 
           const conflicts = commonPorts.filter(p => {
             try {
-              execSync(`lsof -i :${p.port} -sTCP:LISTEN -t 2>/dev/null || ss -tlnp 'sport = :${p.port}' 2>/dev/null | grep -oP 'pid=\\K\\d+' || true`, { stdio: 'pipe' });
-              return true;
+              const output = execSync(`lsof -i :${p.port} -sTCP:LISTEN 2>/dev/null | grep -v 'docker-pr' | grep -v 'COMMAND' || true`, { stdio: 'pipe' }).toString().trim();
+              return output.length > 0;
             } catch {
               return false;
             }
@@ -622,7 +756,7 @@ export function registerInstallCommand(program: Command) {
             for (const c of conflicts) {
               let processInfo = '';
               try {
-                const pid = execSync(`lsof -i :${c.port} -sTCP:LISTEN -t 2>/dev/null | head -1 || true`, { stdio: 'pipe' }).toString().trim();
+                const pid = execSync(`lsof -i :${c.port} -sTCP:LISTEN -t 2>/dev/null | grep -v 'docker-pr' | head -1 || true`, { stdio: 'pipe' }).toString().trim();
                 if (pid) {
                   const procName = execSync(`ps -p ${pid} -o comm= 2>/dev/null || echo 'desconocido'`, { stdio: 'pipe' }).toString().trim();
                   processInfo = ` (${procName})`;
